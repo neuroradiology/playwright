@@ -30,9 +30,8 @@ class MDOutline {
     const writer = new commonmark.HtmlRenderer();
     const html = writer.render(parsed);
 
-    page.on('console', msg => {
-      console.log(msg.text());
-    });
+    const logConsole = msg => console.log(msg.text());
+    page.on('console', logConsole);
     // Extract headings.
     await page.setContent(html);
     const {classes, errors} = await page.evaluate(() => {
@@ -47,27 +46,40 @@ class MDOutline {
 
       /**
        * @param {HTMLLIElement} element
+       * @param {boolean} defaultRequired
        */
-      function parseProperty(element) {
+      function parseProperty(element, defaultRequired) {
         const clone = element.cloneNode(true);
         const ul = clone.querySelector(':scope > ul');
         const str = parseComment(extractSiblingsIntoFragment(clone.firstChild, ul));
         const name = str.substring(0, str.indexOf('<')).replace(/\`/g, '').trim();
         const type = findType(str);
         const properties = [];
-        const comment = str.substring(str.indexOf('<') + type.length + 2).trim();
+        let comment = str.substring(str.indexOf('<') + type.length + 2).trim();
         const hasNonEnumProperties = type.split('|').some(part => {
-          return part !== 'string' && part !== 'number' && part !== 'Array<string>' && !(part[0] === '"' && part[part.length - 1] === '"');
+          const basicTypes = new Set(['string', 'number', 'boolean']);
+          const arrayTypes = new Set([...basicTypes].map(type => `Array<${type}>`));
+          return !basicTypes.has(part) && !arrayTypes.has(part) && !(part.startsWith('"') && part.endsWith('"'));
         });
         if (hasNonEnumProperties) {
           for (const childElement of element.querySelectorAll(':scope > ul > li')) {
             const text = childElement.textContent;
             if (text.startsWith(`"`) || text.startsWith(`'`))
               continue;
-            const property = parseProperty(childElement);
-            property.required = property.comment.includes('***required***');
+            const property = parseProperty(childElement, true);
+            property.required = defaultRequired;
+            if (property.comment.toLowerCase().includes('defaults to '))
+              property.required = false;
+            if (property.comment.toLowerCase().includes('if applicable.'))
+              property.required = false;
+            if (property.comment.toLowerCase().includes('if available.'))
+              property.required = false;
+            if (property.comment.includes('**required**'))
+              property.required = true;
             properties.push(property);
           }
+        } else if (ul) {
+          comment += '\n' + parseComment(ul).split('\n').map(l => ` - ${l}`).join('\n');
         }
         return {
           name,
@@ -98,6 +110,18 @@ class MDOutline {
        */
       function parseClass(content) {
         const members = [];
+        const commentWalker = document.createTreeWalker(content, NodeFilter.SHOW_COMMENT | NodeFilter.SHOW_ELEMENT, {
+          acceptNode(node) {
+            if (node instanceof HTMLElement && node.tagName === 'H4')
+              return NodeFilter.FILTER_ACCEPT;
+            if (!(node instanceof Comment))
+              return NodeFilter.FILTER_REJECT;
+            if (node.data.trim().startsWith('GEN:toc'))
+              return NodeFilter.FILTER_ACCEPT;
+            return NodeFilter.FILTER_REJECT;
+          }
+        });
+        const commentEnd = commentWalker.nextNode();
         const headers = content.querySelectorAll('h4');
         const name = content.firstChild.textContent;
         let extendsName = null;
@@ -107,7 +131,7 @@ class MDOutline {
           commentStart = extendsElement.nextSibling;
           extendsName = extendsElement.querySelector('a').textContent;
         }
-        const comment = parseComment(extractSiblingsIntoFragment(commentStart, headers[0]));
+        const comment = parseComment(extractSiblingsIntoFragment(commentStart, commentEnd));
         for (let i = 0; i < headers.length; i++) {
           const fragment = extractSiblingsIntoFragment(headers[i], headers[i + 1]);
           members.push(parseMember(fragment));
@@ -134,7 +158,6 @@ class MDOutline {
       }
 
       /**
-       * @param {string} name
        * @param {DocumentFragment} content
        */
       function parseMember(content) {
@@ -151,13 +174,13 @@ class MDOutline {
         const ul = content.querySelector('ul');
         for (const element of content.querySelectorAll('h4 + ul > li')) {
           if (element.matches('li') && element.textContent.trim().startsWith('<')) {
-            returnType = parseProperty(element);
+            returnType = parseProperty(element, false);
           } else if (element.matches('li') && element.firstChild.matches && element.firstChild.matches('code')) {
-            const property = parseProperty(element);
-            property.required = !optionalparams.has(property.name);
+            const property = parseProperty(element, false);
+            property.required = !optionalparams.has(property.name) && !property.name.startsWith('...');
             args.push(property);
           } else if (element.matches('li') && element.firstChild.nodeType === Element.TEXT_NODE && element.firstChild.textContent.toLowerCase().startsWith('return')) {
-            returnType = parseProperty(element);
+            returnType = parseProperty(element, true);
             const expectedText = 'returns: ';
             let actualText = element.firstChild.textContent;
             let angleIndex = actualText.indexOf('<');
@@ -169,7 +192,7 @@ class MDOutline {
               errors.push(`${name} has mistyped 'return' type declaration: expected exactly '${expectedText}', found '${actualText}'.`);
           }
         }
-        const comment = parseComment(extractSiblingsIntoFragment(ul ? ul.nextSibling : content));
+        const comment = parseComment(extractSiblingsIntoFragment(ul ? ul.nextSibling : content.querySelector('h4').nextSibling));
         return {
           name,
           args,
@@ -194,6 +217,7 @@ class MDOutline {
         return fragment;
       }
     });
+    page.off('console', logConsole);
     return new MDOutline(classes, errors);
   }
 
@@ -306,7 +330,7 @@ module.exports = async function(page, sources) {
 
   // Push base class documentation to derived classes.
   for (const [name, clazz] of documentation.classes.entries()) {
-    clazz.validateOrder(errors);
+    clazz.validateOrder(errors, clazz);
 
     if (!clazz.extends || clazz.extends === 'EventEmitter' || clazz.extends === 'Error')
       continue;

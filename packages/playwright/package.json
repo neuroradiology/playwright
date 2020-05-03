@@ -1,17 +1,18 @@
 {
   "name": "playwright",
-  "version": "0.9.21-post",
+  "version": "0.16.0-post",
   "description": "A high-level API to automate web browsers",
   "repository": "github:Microsoft/playwright",
   "main": "index.js",
   "scripts": {
-    "install": "node install.js"
+    "install": "node install.js",
+    "prepublishOnly": "cp ../../README.md ."
   },
   "author": {
     "name": "Microsoft Corporation"
   },
   "license": "Apache-2.0",
   "dependencies": {
-    "playwright-core": "=0.9.21-post"
+    "playwright-core": "=0.16.0-post"
   }
 }

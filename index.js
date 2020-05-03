@@ -14,19 +14,6 @@
  * limitations under the License.
  */
 
-const {helper} = require('./lib/helper');
-const api = require('./lib/api');
-const packageJson = require('./package.json');
-const { DeviceDescriptors } = require('./lib/deviceDescriptors');
+const { Playwright } = require('./lib/server/playwright');
 
-for (const className in api) {
-  if (typeof api[className] === 'function')
-    helper.installApiHooks(className, api[className]);
-}
-
-module.exports = {
-  chromium: new api.ChromiumPlaywright(__dirname, packageJson.playwright.chromium_revision),
-  firefox: new api.FirefoxPlaywright(__dirname, packageJson.playwright.firefox_revision),
-  webkit: new api.WebKitPlaywright(__dirname, packageJson.playwright.webkit_revision),
-  devices: DeviceDescriptors
-};
+module.exports = new Playwright(__dirname, require('./browsers.json')['browsers']);

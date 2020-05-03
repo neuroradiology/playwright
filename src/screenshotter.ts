@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+import * as fs from 'fs';
+import * as mime from 'mime';
+import * as util from 'util';
 import * as dom from './dom';
-import { assert } from './helper';
-import * as types from './types';
+import { assert, helper } from './helper';
 import { Page } from './page';
-import * as platform from './platform';
+import * as types from './types';
 
 export class Screenshotter {
   private _queue = new TaskQueue();
@@ -28,7 +30,7 @@ export class Screenshotter {
   constructor(page: Page) {
     this._page = page;
 
-    const browserContext = page.browserContext();
+    const browserContext = page.context();
     this._queue = (browserContext as any)[taskQueueSymbol];
     if (!this._queue) {
       this._queue = new TaskQueue();
@@ -36,130 +38,124 @@ export class Screenshotter {
     }
   }
 
-  async screenshotPage(options: types.ScreenshotOptions = {}): Promise<platform.BufferType> {
-    const format = validateScreeshotOptions(options);
+  private async _originalViewportSize(): Promise<{ viewportSize: types.Size, originalViewportSize: types.Size | null }> {
+    const originalViewportSize = this._page.viewportSize();
+    let viewportSize = originalViewportSize;
+    if (!viewportSize) {
+      const context = await this._page.mainFrame()._utilityContext();
+      viewportSize = await context.evaluateInternal(() => {
+        if (!document.body || !document.documentElement)
+          return null;
+        return {
+          width: Math.max(document.body.offsetWidth, document.documentElement.offsetWidth),
+          height: Math.max(document.body.offsetHeight, document.documentElement.offsetHeight),
+        };
+      });
+      if (!viewportSize)
+        throw new Error(kScreenshotDuringNavigationError);
+    }
+    return { viewportSize, originalViewportSize };
+  }
+
+  private async _fullPageSize(): Promise<types.Size> {
+    const context = await this._page.mainFrame()._utilityContext();
+    const fullPageSize = await context.evaluateInternal(() => {
+      if (!document.body || !document.documentElement)
+        return null;
+      return {
+        width: Math.max(
+            document.body.scrollWidth, document.documentElement.scrollWidth,
+            document.body.offsetWidth, document.documentElement.offsetWidth,
+            document.body.clientWidth, document.documentElement.clientWidth
+        ),
+        height: Math.max(
+            document.body.scrollHeight, document.documentElement.scrollHeight,
+            document.body.offsetHeight, document.documentElement.offsetHeight,
+            document.body.clientHeight, document.documentElement.clientHeight
+        ),
+      };
+    });
+    if (!fullPageSize)
+      throw new Error(kScreenshotDuringNavigationError);
+    return fullPageSize;
+  }
+
+  async screenshotPage(options: types.ScreenshotOptions = {}): Promise<Buffer> {
+    const format = validateScreenshotOptions(options);
     return this._queue.postTask(async () => {
-      let overridenViewport: types.Viewport | undefined;
-      const viewport = this._page.viewport();
-      let viewportSize: types.Size | undefined;
-      if (!viewport) {
-        viewportSize = await this._page.evaluate(() => {
-          if (!document.body || !document.documentElement)
-            return;
-          return {
-            width: Math.max(document.body.offsetWidth, document.documentElement.offsetWidth),
-            height: Math.max(document.body.offsetHeight, document.documentElement.offsetHeight),
-          };
-        });
-        if (!viewportSize)
-          throw new Error(kScreenshotDuringNavigationError);
-      }
-      if (options.fullPage && !this._page._delegate.canScreenshotOutsideViewport()) {
-        const fullPageRect = await this._page.evaluate(() => {
-          if (!document.body || !document.documentElement)
-            return null;
-          return {
-            width: Math.max(
-                document.body.scrollWidth, document.documentElement.scrollWidth,
-                document.body.offsetWidth, document.documentElement.offsetWidth,
-                document.body.clientWidth, document.documentElement.clientWidth
-            ),
-            height: Math.max(
-                document.body.scrollHeight, document.documentElement.scrollHeight,
-                document.body.offsetHeight, document.documentElement.offsetHeight,
-                document.body.clientHeight, document.documentElement.clientHeight
-            ),
-          };
-        });
-        if (!fullPageRect)
-          throw new Error(kScreenshotDuringNavigationError);
-        overridenViewport = viewport ? { ...viewport, ...fullPageRect } : fullPageRect;
-        await this._page.setViewport(overridenViewport);
-      } else if (options.clip) {
-        options.clip = trimClipToViewport(viewport, options.clip);
+      const { viewportSize, originalViewportSize } = await this._originalViewportSize();
+
+      if (options.fullPage) {
+        const fullPageSize = await this._fullPageSize();
+        let documentRect = { x: 0, y: 0, width: fullPageSize.width, height: fullPageSize.height };
+        let overridenViewportSize: types.Size | null = null;
+        const fitsViewport = fullPageSize.width <= viewportSize.width && fullPageSize.height <= viewportSize.height;
+        if (!this._page._delegate.canScreenshotOutsideViewport() && !fitsViewport) {
+          overridenViewportSize = fullPageSize;
+          await this._page.setViewportSize(overridenViewportSize);
+        }
+        if (options.clip)
+          documentRect = trimClipToSize(options.clip, documentRect);
+        return await this._screenshot(format, documentRect, undefined, options, overridenViewportSize, originalViewportSize);
       }
 
-      const result = await this._screenshot(format, options, (overridenViewport || viewport)!);
-
-      if (overridenViewport) {
-        if (viewport)
-          await this._page.setViewport(viewport);
-        else
-          await this._page._delegate.resetViewport(viewportSize!);
-      }
-      return result;
+      const viewportRect = options.clip ? trimClipToSize(options.clip, viewportSize) : { x: 0, y: 0, ...viewportSize };
+      return await this._screenshot(format, undefined, viewportRect, options, null, originalViewportSize);
     }).catch(rewriteError);
   }
 
-  async screenshotElement(handle: dom.ElementHandle, options: types.ElementScreenshotOptions = {}): Promise<platform.BufferType> {
-    const format = validateScreeshotOptions(options);
-    const rewrittenOptions: types.ScreenshotOptions = { ...options };
+  async screenshotElement(handle: dom.ElementHandle, options: types.ElementScreenshotOptions = {}): Promise<Buffer> {
+    const format = validateScreenshotOptions(options);
     return this._queue.postTask(async () => {
-      let overridenViewport: types.Viewport | undefined;
-      let viewportSize: types.Size;
+      const { viewportSize, originalViewportSize } = await this._originalViewportSize();
 
-      let maybeBoundingBox = await this._page._delegate.getBoundingBoxForScreenshot(handle);
-      assert(maybeBoundingBox, 'Node is either not visible or not an HTMLElement');
-      let boundingBox = maybeBoundingBox!;
+      await handle.scrollIntoViewIfNeeded();
+      let boundingBox = await handle.boundingBox();
+      assert(boundingBox, 'Node is either not visible or not an HTMLElement');
       assert(boundingBox.width !== 0, 'Node has 0 width.');
       assert(boundingBox.height !== 0, 'Node has 0 height.');
-      boundingBox = enclosingIntRect(boundingBox);
 
-      const viewport = this._page.viewport();
-      if (!this._page._delegate.canScreenshotOutsideViewport()) {
-        if (!viewport) {
-          const maybeViewportSize = await this._page.evaluate(() => {
-            if (!document.body || !document.documentElement)
-              return;
-            return {
-              width: Math.max(document.body.offsetWidth, document.documentElement.offsetWidth),
-              height: Math.max(document.body.offsetHeight, document.documentElement.offsetHeight),
-            };
-          });
-          if (!maybeViewportSize)
-            throw new Error(kScreenshotDuringNavigationError);
-          viewportSize = maybeViewportSize!;
-        } else {
-          viewportSize = viewport;
-        }
-        if (boundingBox.width > viewportSize.width || boundingBox.height > viewportSize.height) {
-          overridenViewport = {... (viewport || viewportSize)};
-          overridenViewport.width = Math.max(viewportSize.width, boundingBox.width);
-          overridenViewport.height = Math.max(viewportSize.height, boundingBox.height);
-          await this._page.setViewport(overridenViewport);
-        }
+      let overridenViewportSize: types.Size | null = null;
+      const fitsViewport = boundingBox.width <= viewportSize.width && boundingBox.height <= viewportSize.height;
+      if (!this._page._delegate.canScreenshotOutsideViewport() && !fitsViewport) {
+        overridenViewportSize = helper.enclosingIntSize({
+          width: Math.max(viewportSize.width, boundingBox.width),
+          height: Math.max(viewportSize.height, boundingBox.height),
+        });
+        await this._page.setViewportSize(overridenViewportSize);
 
         await handle.scrollIntoViewIfNeeded();
-        maybeBoundingBox = await this._page._delegate.getBoundingBoxForScreenshot(handle);
-        assert(maybeBoundingBox, 'Node is either not visible or not an HTMLElement');
-        boundingBox = enclosingIntRect(maybeBoundingBox!);
+        boundingBox = await handle.boundingBox();
+        assert(boundingBox, 'Node is either not visible or not an HTMLElement');
+        assert(boundingBox.width !== 0, 'Node has 0 width.');
+        assert(boundingBox.height !== 0, 'Node has 0 height.');
       }
 
-      if (!overridenViewport)
-        rewrittenOptions.clip = boundingBox;
-
-      const result = await this._screenshot(format, rewrittenOptions, (overridenViewport || viewport)!);
-
-      if (overridenViewport) {
-        if (viewport)
-          await this._page.setViewport(viewport);
-        else
-          await this._page._delegate.resetViewport(viewportSize!);
-      }
-
-      return result;
+      const context = await this._page.mainFrame()._utilityContext();
+      const scrollOffset = await context.evaluateInternal(() => ({ x: window.scrollX, y: window.scrollY }));
+      const documentRect = { ...boundingBox };
+      documentRect.x += scrollOffset.x;
+      documentRect.y += scrollOffset.y;
+      return await this._screenshot(format, helper.enclosingIntRect(documentRect), undefined, options, overridenViewportSize, originalViewportSize);
     }).catch(rewriteError);
   }
 
-  private async _screenshot(format: 'png' | 'jpeg', options: types.ScreenshotOptions, viewport: types.Viewport): Promise<platform.BufferType> {
+  private async _screenshot(format: 'png' | 'jpeg', documentRect: types.Rect | undefined, viewportRect: types.Rect | undefined, options: types.ElementScreenshotOptions, overridenViewportSize: types.Size | null, originalViewportSize: types.Size | null): Promise<Buffer> {
     const shouldSetDefaultBackground = options.omitBackground && format === 'png';
     if (shouldSetDefaultBackground)
       await this._page._delegate.setBackgroundColor({ r: 0, g: 0, b: 0, a: 0});
-    const buffer = await this._page._delegate.takeScreenshot(format, options, viewport);
+    const buffer = await this._page._delegate.takeScreenshot(format, documentRect, viewportRect, options.quality);
     if (shouldSetDefaultBackground)
       await this._page._delegate.setBackgroundColor();
+    if (overridenViewportSize) {
+      assert(!this._page._delegate.canScreenshotOutsideViewport());
+      if (originalViewportSize)
+        await this._page.setViewportSize(originalViewportSize);
+      else
+        await this._page._delegate.resetViewport();
+    }
     if (options.path)
-      await platform.writeFileAsync(options.path, buffer);
+      await util.promisify(fs.writeFile)(options.path, buffer);
     return buffer;
   }
 }
@@ -180,17 +176,21 @@ class TaskQueue {
   }
 }
 
-function trimClipToViewport(viewport: types.Viewport | null, clip: types.Rect | undefined): types.Rect | undefined {
-  if (!clip || !viewport)
-    return clip;
-  const p1 = { x: Math.min(clip.x, viewport.width), y: Math.min(clip.y, viewport.height) };
-  const p2 = { x: Math.min(clip.x + clip.width, viewport.width), y: Math.min(clip.y + clip.height, viewport.height) };
+function trimClipToSize(clip: types.Rect, size: types.Size): types.Rect {
+  const p1 = {
+    x: Math.max(0, Math.min(clip.x, size.width)),
+    y: Math.max(0, Math.min(clip.y, size.height))
+  };
+  const p2 = {
+    x: Math.max(0, Math.min(clip.x + clip.width, size.width)),
+    y: Math.max(0, Math.min(clip.y + clip.height, size.height))
+  };
   const result = { x: p1.x, y: p1.y, width: p2.x - p1.x, height: p2.y - p1.y };
-  assert(result.width && result.height, 'Clipped area is either empty or outside the viewport');
+  assert(result.width && result.height, 'Clipped area is either empty or outside the resulting image');
   return result;
 }
 
-function validateScreeshotOptions(options: types.ScreenshotOptions): 'png' | 'jpeg' {
+function validateScreenshotOptions(options: types.ScreenshotOptions): 'png' | 'jpeg' {
   let format: 'png' | 'jpeg' | null = null;
   // options.type takes precedence over inferring the type from options.path
   // because it may be a 0-length file with no extension created beforehand (i.e. as a temp file).
@@ -198,7 +198,7 @@ function validateScreeshotOptions(options: types.ScreenshotOptions): 'png' | 'jp
     assert(options.type === 'png' || options.type === 'jpeg', 'Unknown options.type value: ' + options.type);
     format = options.type;
   } else if (options.path) {
-    const mimeType = platform.getMimeType(options.path);
+    const mimeType = mime.getType(options.path);
     if (mimeType === 'image/png')
       format = 'png';
     else if (mimeType === 'image/jpeg')
@@ -215,7 +215,6 @@ function validateScreeshotOptions(options: types.ScreenshotOptions): 'png' | 'jp
     assert(Number.isInteger(options.quality), 'Expected options.quality to be an integer');
     assert(options.quality >= 0 && options.quality <= 100, 'Expected options.quality to be between 0 and 100 (inclusive), got ' + options.quality);
   }
-  assert(!options.clip || !options.fullPage, 'options.clip and options.fullPage are exclusive');
   if (options.clip) {
     assert(typeof options.clip.x === 'number', 'Expected options.clip.x to be a number but found ' + (typeof options.clip.x));
     assert(typeof options.clip.y === 'number', 'Expected options.clip.y to be a number but found ' + (typeof options.clip.y));
@@ -225,14 +224,6 @@ function validateScreeshotOptions(options: types.ScreenshotOptions): 'png' | 'jp
     assert(options.clip.height !== 0, 'Expected options.clip.height not to be 0.');
   }
   return format;
-}
-
-function enclosingIntRect(rect: types.Rect): types.Rect {
-  const x = Math.floor(rect.x + 1e-3);
-  const y = Math.floor(rect.y + 1e-3);
-  const x2 = Math.ceil(rect.x + rect.width - 1e-3);
-  const y2 = Math.ceil(rect.y + rect.height - 1e-3);
-  return { x, y, width: x2 - x, height: y2 - y };
 }
 
 export const kScreenshotDuringNavigationError = 'Cannot take a screenshot while page is navigating';

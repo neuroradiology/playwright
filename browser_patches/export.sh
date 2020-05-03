@@ -35,17 +35,20 @@ fi
 
 # FRIENDLY_CHECKOUT_PATH is used only for logging.
 FRIENDLY_CHECKOUT_PATH="";
+BUILD_NUMBER_UPSTREAM_URL=""
 CHECKOUT_PATH=""
 EXPORT_PATH=""
-if [[ ("$1" == "firefox") || ("$1" == "firefox/") ]]; then
+if [[ ("$1" == "firefox") || ("$1" == "firefox/") || ("$1" == "ff") ]]; then
   FRIENDLY_CHECKOUT_PATH="//browser_patches/firefox/checkout";
   CHECKOUT_PATH="$PWD/firefox/checkout"
-  EXPORT_PATH="$PWD/firefox/"
+  EXPORT_PATH="$PWD/firefox"
+  BUILD_NUMBER_UPSTREAM_URL="https://raw.githubusercontent.com/microsoft/playwright/master/browser_patches/firefox/BUILD_NUMBER"
   source "./firefox/UPSTREAM_CONFIG.sh"
-elif [[ ("$1" == "webkit") || ("$1" == "webkit/") ]]; then
+elif [[ ("$1" == "webkit") || ("$1" == "webkit/") || ("$1" == "wk") ]]; then
   FRIENDLY_CHECKOUT_PATH="//browser_patches/webkit/checkout";
   CHECKOUT_PATH="$PWD/webkit/checkout"
-  EXPORT_PATH="$PWD/webkit/"
+  EXPORT_PATH="$PWD/webkit"
+  BUILD_NUMBER_UPSTREAM_URL="https://raw.githubusercontent.com/microsoft/playwright/master/browser_patches/webkit/BUILD_NUMBER"
   source "./webkit/UPSTREAM_CONFIG.sh"
 else
   echo ERROR: unknown browser to export - "$1"
@@ -97,8 +100,6 @@ else
   echo "-- checking $FRIENDLY_CHECKOUT_PATH is clean - OK"
 fi
 
-git fetch $REMOTE_BROWSER_UPSTREAM $BASE_BRANCH
-
 PATCH_NAME=$(ls -1 $EXPORT_PATH/patches)
 if [[ -z "$PATCH_NAME" ]]; then
   PATCH_NAME="bootstrap.diff"
@@ -109,20 +110,24 @@ fi
 
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 NEW_BASE_REVISION=$(git merge-base $REMOTE_BROWSER_UPSTREAM/$BASE_BRANCH $CURRENT_BRANCH)
-NEW_DIFF=$(git diff --full-index $NEW_BASE_REVISION $CURRENT_BRANCH)
+NEW_DIFF=$(git diff --diff-algorithm=myers --full-index $NEW_BASE_REVISION $CURRENT_BRANCH -- . ":!Tools/Playwright")
+
 # Increment BUILD_NUMBER
-BUILD_NUMBER=$(cat $EXPORT_PATH/BUILD_NUMBER)
+BUILD_NUMBER=$(curl ${BUILD_NUMBER_UPSTREAM_URL})
 BUILD_NUMBER=$((BUILD_NUMBER+1))
-if [[ "$NEW_BASE_REVISION" == "$BASE_REVISION" && "$OLD_DIFF" == "$NEW_DIFF" ]]; then
-  echo "No changes"
-  exit 0
-fi
 
 echo "REMOTE_URL=\"$REMOTE_URL\"
 BASE_BRANCH=\"$BASE_BRANCH\"
 BASE_REVISION=\"$NEW_BASE_REVISION\"" > $EXPORT_PATH/UPSTREAM_CONFIG.sh
 echo "$NEW_DIFF" > $EXPORT_PATH/patches/$PATCH_NAME
 echo $BUILD_NUMBER > $EXPORT_PATH/BUILD_NUMBER
+
+if [[ ("$1" == "webkit") || ("$1" == "webkit/") || ("$1" == "wk") ]]; then
+echo "-- patching WebKit embedders"
+rm -rf $EXPORT_PATH/src/*
+mkdir $EXPORT_PATH/src/Tools
+cp -r Tools/Playwright $EXPORT_PATH/src/Tools/
+fi
 
 NEW_BASE_REVISION_TEXT="$NEW_BASE_REVISION (not changed)"
 if [[ "$NEW_BASE_REVISION" != "$BASE_REVISION" ]]; then

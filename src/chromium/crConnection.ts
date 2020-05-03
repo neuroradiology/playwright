@@ -15,32 +15,38 @@
  * limitations under the License.
  */
 
-import * as platform from '../platform';
-import { ConnectionTransport } from '../transport';
 import { assert } from '../helper';
+import { ConnectionTransport, ProtocolRequest, ProtocolResponse, protocolLog } from '../transport';
 import { Protocol } from './protocol';
-
-const debugProtocol = platform.debug('pw:protocol');
+import { EventEmitter } from 'events';
+import { InnerLogger } from '../logger';
 
 export const ConnectionEvents = {
   Disconnected: Symbol('ConnectionEvents.Disconnected')
 };
 
-export class CRConnection extends platform.EventEmitter {
+// CRPlaywright uses this special id to issue Browser.close command which we
+// should ignore.
+export const kBrowserCloseMessageId = -9999;
+
+export class CRConnection extends EventEmitter {
   private _lastId = 0;
-  private _transport: ConnectionTransport;
-  private _sessions = new Map<string, CRSession>();
+  private readonly _transport: ConnectionTransport;
+  private readonly _sessions = new Map<string, CRSession>();
   readonly rootSession: CRSession;
   _closed = false;
+  private _logger: InnerLogger;
 
-  constructor(transport: ConnectionTransport) {
+  constructor(transport: ConnectionTransport, logger: InnerLogger) {
     super();
     this._transport = transport;
+    this._logger = logger;
     this._transport.onmessage = this._onMessage.bind(this);
     this._transport.onclose = this._onClose.bind(this);
-    this.rootSession = new CRSession(this, 'browser', '');
+    this.rootSession = new CRSession(this, '', 'browser', '');
     this._sessions.set('', this.rootSession);
   }
+
 
   static fromSession(session: CRSession): CRConnection {
     return session._connection!;
@@ -50,34 +56,37 @@ export class CRConnection extends platform.EventEmitter {
     return this._sessions.get(sessionId) || null;
   }
 
-  _rawSend(sessionId: string, message: any): number {
+  _rawSend(sessionId: string, method: string, params: any): number {
     const id = ++this._lastId;
-    message.id = id;
+    const message: ProtocolRequest = { id, method, params };
     if (sessionId)
       message.sessionId = sessionId;
-    const data = JSON.stringify(message);
-    debugProtocol('SEND ► ' + data);
-    this._transport.send(data);
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, 'SEND ► ' + rewriteInjectedScriptEvaluationLog(message));
+    this._transport.send(message);
     return id;
   }
 
-  async _onMessage(message: string) {
-    debugProtocol('◀ RECV ' + message);
-    const object = JSON.parse(message);
-    if (object.method === 'Target.attachedToTarget') {
-      const sessionId = object.params.sessionId;
-      const session = new CRSession(this, object.params.targetInfo.type, sessionId);
+  async _onMessage(message: ProtocolResponse) {
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, '◀ RECV ' + JSON.stringify(message));
+    if (message.id === kBrowserCloseMessageId)
+      return;
+    if (message.method === 'Target.attachedToTarget') {
+      const sessionId = message.params.sessionId;
+      const rootSessionId = message.sessionId || '';
+      const session = new CRSession(this, rootSessionId, message.params.targetInfo.type, sessionId);
       this._sessions.set(sessionId, session);
-    } else if (object.method === 'Target.detachedFromTarget') {
-      const session = this._sessions.get(object.params.sessionId);
+    } else if (message.method === 'Target.detachedFromTarget') {
+      const session = this._sessions.get(message.params.sessionId);
       if (session) {
         session._onClosed();
-        this._sessions.delete(object.params.sessionId);
+        this._sessions.delete(message.params.sessionId);
       }
     }
-    const session = this._sessions.get(object.sessionId || '');
+    const session = this._sessions.get(message.sessionId || '');
     if (session)
-      session._onMessage(object);
+      session._onMessage(message);
   }
 
   _onClose() {
@@ -110,20 +119,23 @@ export const CRSessionEvents = {
   Disconnected: Symbol('Events.CDPSession.Disconnected')
 };
 
-export class CRSession extends platform.EventEmitter {
+export class CRSession extends EventEmitter {
   _connection: CRConnection | null;
-  private _callbacks = new Map<number, {resolve:(o: any) => void, reject: (e: Error) => void, error: Error, method: string}>();
-  private _targetType: string;
-  private _sessionId: string;
+  private readonly _callbacks = new Map<number, {resolve: (o: any) => void, reject: (e: Error) => void, error: Error, method: string}>();
+  private readonly _targetType: string;
+  private readonly _sessionId: string;
+  private readonly _rootSessionId: string;
+  private _crashed: boolean = false;
   on: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   addListener: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   off: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   removeListener: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   once: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
 
-  constructor(connection: CRConnection, targetType: string, sessionId: string) {
+  constructor(connection: CRConnection, rootSessionId: string, targetType: string, sessionId: string) {
     super();
     this._connection = connection;
+    this._rootSessionId = rootSessionId;
     this._targetType = targetType;
     this._sessionId = sessionId;
 
@@ -134,36 +146,45 @@ export class CRSession extends platform.EventEmitter {
     this.once = super.once;
   }
 
-  send<T extends keyof Protocol.CommandParameters>(
+  _markAsCrashed() {
+    this._crashed = true;
+  }
+
+  async send<T extends keyof Protocol.CommandParameters>(
     method: T,
     params?: Protocol.CommandParameters[T]
   ): Promise<Protocol.CommandReturnValues[T]> {
+    if (this._crashed)
+      throw new Error('Target crashed');
     if (!this._connection)
-      return Promise.reject(new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`));
-    const id = this._connection._rawSend(this._sessionId, { method, params });
+      throw new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`);
+    const id = this._connection._rawSend(this._sessionId, method, params);
     return new Promise((resolve, reject) => {
       this._callbacks.set(id, {resolve, reject, error: new Error(), method});
     });
   }
 
-  _onMessage(object: { id?: number; method: string; params: any; error: { message: string; data: any; }; result?: any; }) {
+  _onMessage(object: ProtocolResponse) {
     if (object.id && this._callbacks.has(object.id)) {
       const callback = this._callbacks.get(object.id)!;
       this._callbacks.delete(object.id);
       if (object.error)
-        callback.reject(createProtocolError(callback.error, callback.method, object));
+        callback.reject(createProtocolError(callback.error, callback.method, object.error));
       else
         callback.resolve(object.result);
     } else {
       assert(!object.id);
-      Promise.resolve().then(() => this.emit(object.method, object.params));
+      Promise.resolve().then(() => this.emit(object.method!, object.params));
     }
   }
 
   async detach() {
     if (!this._connection)
       throw new Error(`Session already detached. Most likely the ${this._targetType} has been closed.`);
-    await this._connection.rootSession.send('Target.detachFromTarget', { sessionId: this._sessionId });
+    const rootSession = this._connection.session(this._rootSessionId);
+    if (!rootSession)
+      throw new Error('Root session has been closed');
+    await rootSession.send('Target.detachFromTarget', { sessionId: this._sessionId });
   }
 
   _onClosed() {
@@ -175,14 +196,22 @@ export class CRSession extends platform.EventEmitter {
   }
 }
 
-function createProtocolError(error: Error, method: string, object: { error: { message: string; data: any; }; }): Error {
-  let message = `Protocol error (${method}): ${object.error.message}`;
-  if ('data' in object.error)
-    message += ` ${object.error.data}`;
+function createProtocolError(error: Error, method: string, protocolError: { message: string; data: any; }): Error {
+  let message = `Protocol error (${method}): ${protocolError.message}`;
+  if ('data' in protocolError)
+    message += ` ${protocolError.data}`;
   return rewriteError(error, message);
 }
 
 function rewriteError(error: Error, message: string): Error {
   error.message = message;
   return error;
+}
+
+function rewriteInjectedScriptEvaluationLog(message: ProtocolRequest): string {
+  // Injected script is very long and clutters protocol logs.
+  // To increase development velocity, we skip replace it with short description in the log.
+  if (message.method === 'Runtime.evaluate' && message.params && message.params.expression && message.params.expression.includes('src/injected/injected.ts'))
+    return `{"id":${message.id} [evaluate injected script]}`;
+  return JSON.stringify(message);
 }

@@ -15,17 +15,19 @@
  * limitations under the License.
  */
 
-import * as types from './types';
-import * as js from './javascript';
-import * as dom from './dom';
-import * as network from './network';
-import { helper, assert, RegisteredListener } from './helper';
-import { ClickOptions, MultiClickOptions, PointerActionOptions } from './input';
-import { TimeoutError } from './errors';
-import { Events } from './events';
-import { Page } from './page';
+import * as fs from 'fs';
+import * as util from 'util';
 import { ConsoleMessage } from './console';
-import * as platform from './platform';
+import * as dom from './dom';
+import { TimeoutError, NotConnectedError } from './errors';
+import { Events } from './events';
+import { assert, helper, RegisteredListener, assertMaxArguments } from './helper';
+import * as js from './javascript';
+import * as network from './network';
+import { Page } from './page';
+import { selectors } from './selectors';
+import * as types from './types';
+import { waitForTimeoutWasUsed } from './hints';
 
 type ContextType = 'main' | 'utility';
 type ContextData = {
@@ -35,32 +37,21 @@ type ContextData = {
   rerunnableTasks: Set<RerunnableTask>;
 };
 
-export type NavigateOptions = {
-  timeout?: number,
-  waitUntil?: LifecycleEvent | LifecycleEvent[],
-};
-
-export type WaitForNavigationOptions = NavigateOptions & { url?: types.URLMatch };
-
-export type GotoOptions = NavigateOptions & {
+export type GotoOptions = types.NavigateOptions & {
   referer?: string,
 };
 export type GotoResult = {
   newDocumentId?: string,
-  isSameDocument?: boolean,
 };
 
-export type LifecycleEvent = 'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2';
-const kLifecycleEvents: Set<LifecycleEvent> = new Set(['load', 'domcontentloaded', 'networkidle0', 'networkidle2']);
-
-export type WaitForOptions = types.TimeoutOptions & { waitFor?: types.Visibility | 'nowait' };
+type ConsoleTagHandler = () => void;
 
 export class FrameManager {
   private _page: Page;
   private _frames = new Map<string, Frame>();
-  private _webSockets = new Map<string, network.WebSocket>();
   private _mainFrame: Frame;
-  readonly _lifecycleWatchers = new Set<LifecycleWatcher>();
+  readonly _consoleMessageTags = new Map<string, ConsoleTagHandler>();
+  readonly _signalBarriers = new Set<SignalBarrier>();
 
   constructor(page: Page) {
     this._page = page;
@@ -109,21 +100,63 @@ export class FrameManager {
     }
   }
 
+  async waitForSignalsCreatedBy<T>(action: () => Promise<T>, deadline: number, options: types.NavigatingActionWaitOptions = {}, input?: boolean): Promise<T> {
+    if (options.noWaitAfter)
+      return action();
+    const barrier = new SignalBarrier(options, deadline);
+    this._signalBarriers.add(barrier);
+    try {
+      const result = await action();
+      if (input)
+        await this._page._delegate.inputActionEpilogue();
+      await barrier.waitFor();
+      // Resolve in the next task, after all waitForNavigations.
+      await new Promise(helper.makeWaitForNextTask());
+      return result;
+    } finally {
+      this._signalBarriers.delete(barrier);
+    }
+  }
+
+  frameWillPotentiallyRequestNavigation() {
+    for (const barrier of this._signalBarriers)
+      barrier.retain();
+  }
+
+  frameDidPotentiallyRequestNavigation() {
+    for (const barrier of this._signalBarriers)
+      barrier.release();
+  }
+
+  frameRequestedNavigation(frameId: string, documentId: string) {
+    const frame = this._frames.get(frameId);
+    if (!frame)
+      return;
+    for (const barrier of this._signalBarriers)
+      barrier.addFrameNavigation(frame);
+    frame._pendingDocumentId = documentId;
+  }
+
+  frameUpdatedDocumentIdForNavigation(frameId: string, documentId: string) {
+    const frame = this._frames.get(frameId);
+    if (!frame)
+      return;
+    frame._pendingDocumentId = documentId;
+  }
+
   frameCommittedNewDocumentNavigation(frameId: string, url: string, name: string, documentId: string, initial: boolean) {
     const frame = this._frames.get(frameId)!;
-    for (const child of frame.childFrames())
-      this._removeFramesRecursively(child);
+    this.removeChildFramesRecursively(frame);
     frame._url = url;
     frame._name = name;
+    assert(!frame._pendingDocumentId || frame._pendingDocumentId === documentId);
     frame._lastDocumentId = documentId;
-    this.frameLifecycleEvent(frameId, 'clear');
-    this.clearInflightRequests(frame);
-    this.clearWebSockets(frame);
-    if (!initial) {
-      for (const watcher of this._lifecycleWatchers)
-        watcher._onCommittedNewDocumentNavigation(frame);
+    frame._pendingDocumentId = '';
+    for (const task of frame._frameTasks)
+      task.onNewDocument(documentId);
+    this.clearFrameLifecycle(frame);
+    if (!initial)
       this._page.emit(Events.Page.FrameNavigated, frame);
-    }
   }
 
   frameCommittedSameDocumentNavigation(frameId: string, url: string) {
@@ -131,8 +164,8 @@ export class FrameManager {
     if (!frame)
       return;
     frame._url = url;
-    for (const watcher of this._lifecycleWatchers)
-      watcher._onNavigatedWithinDocument(frame);
+    for (const task of frame._frameTasks)
+      task.onSameDocument();
     this._page.emit(Events.Page.FrameNavigated, frame);
   }
 
@@ -150,58 +183,40 @@ export class FrameManager {
     const hasLoad = frame._firedLifecycleEvents.has('load');
     frame._firedLifecycleEvents.add('domcontentloaded');
     frame._firedLifecycleEvents.add('load');
-    for (const watcher of this._lifecycleWatchers)
-      watcher._onLifecycleEvent(frame);
+    this._notifyLifecycle(frame);
     if (frame === this.mainFrame() && !hasDOMContentLoaded)
       this._page.emit(Events.Page.DOMContentLoaded);
     if (frame === this.mainFrame() && !hasLoad)
       this._page.emit(Events.Page.Load);
   }
 
-  frameLifecycleEvent(frameId: string, event: LifecycleEvent | 'clear') {
+  frameLifecycleEvent(frameId: string, event: types.LifecycleEvent) {
     const frame = this._frames.get(frameId);
     if (!frame)
       return;
-    if (event === 'clear') {
-      frame._firedLifecycleEvents.clear();
-    } else {
-      frame._firedLifecycleEvents.add(event);
-      for (const watcher of this._lifecycleWatchers)
-        watcher._onLifecycleEvent(frame);
-    }
+    frame._firedLifecycleEvents.add(event);
+    this._notifyLifecycle(frame);
     if (frame === this._mainFrame && event === 'load')
       this._page.emit(Events.Page.Load);
     if (frame === this._mainFrame && event === 'domcontentloaded')
       this._page.emit(Events.Page.DOMContentLoaded);
   }
 
-  clearInflightRequests(frame: Frame) {
+  clearFrameLifecycle(frame: Frame) {
+    frame._firedLifecycleEvents.clear();
     // Keep the current navigation request if any.
     frame._inflightRequests = new Set(Array.from(frame._inflightRequests).filter(request => request._documentId === frame._lastDocumentId));
-    this._stopNetworkIdleTimer(frame, 'networkidle0');
+    frame._stopNetworkIdleTimer();
     if (frame._inflightRequests.size === 0)
-      this._startNetworkIdleTimer(frame, 'networkidle0');
-    this._stopNetworkIdleTimer(frame, 'networkidle2');
-    if (frame._inflightRequests.size <= 2)
-      this._startNetworkIdleTimer(frame, 'networkidle2');
-  }
-
-  clearWebSockets(frame: Frame) {
-    // TODO: attributet sockets to frames.
-    if (frame.parentFrame())
-      return;
-    this._webSockets.clear();
+      frame._startNetworkIdleTimer();
   }
 
   requestStarted(request: network.Request) {
     this._inflightRequestStarted(request);
-    const frame = request.frame();
-    if (request._documentId && frame && !request.redirectChain().length) {
-      for (const watcher of this._lifecycleWatchers)
-        watcher._onNavigationRequest(frame, request);
-    }
+    for (const task of request.frame()._frameTasks)
+      task.onRequest(request);
     if (!request._isFavicon)
-      this._page.emit(Events.Page.Request, request);
+      this._page._requestStarted(request);
   }
 
   requestReceivedResponse(response: network.Response) {
@@ -217,125 +232,84 @@ export class FrameManager {
 
   requestFailed(request: network.Request, canceled: boolean) {
     this._inflightRequestFinished(request);
-    const frame = request.frame();
-    if (request._documentId && frame) {
-      const isCurrentDocument = frame._lastDocumentId === request._documentId;
-      if (!isCurrentDocument) {
+    if (request._documentId) {
+      const isPendingDocument = request.frame()._pendingDocumentId === request._documentId;
+      if (isPendingDocument) {
+        request.frame()._pendingDocumentId = '';
         let errorText = request.failure()!.errorText;
         if (canceled)
           errorText += '; maybe frame was detached?';
-        for (const watcher of this._lifecycleWatchers)
-          watcher._onAbortedNewDocumentNavigation(frame, request._documentId, errorText);
+        for (const task of request.frame()._frameTasks)
+          task.onNewDocument(request._documentId, new Error(errorText));
       }
     }
     if (!request._isFavicon)
       this._page.emit(Events.Page.RequestFailed, request);
   }
 
-  onWebSocketCreated(requestId: string, url: string) {
-    const ws = new network.WebSocket(url);
-    this._webSockets.set(requestId, ws);
+  provisionalLoadFailed(frame: Frame, documentId: string, error: string) {
+    for (const task of frame._frameTasks)
+      task.onNewDocument(documentId, new Error(error));
   }
 
-  onWebSocketRequest(requestId: string, headers: network.Headers) {
-    const ws = this._webSockets.get(requestId);
-    if (ws) {
-      ws._requestSent(headers);
-      this._page.emit(Events.Page.WebSocket, ws);
+  private _notifyLifecycle(frame: Frame) {
+    for (let parent: Frame | null = frame; parent; parent = parent.parentFrame()) {
+      for (const frameTask of parent._frameTasks)
+        frameTask.onLifecycle();
     }
   }
 
-  onWebSocketResponse(requestId: string, status: number, statusText: string, headers: network.Headers) {
-    const ws = this._webSockets.get(requestId);
-    if (ws)
-      ws._responseReceived(status, statusText, headers);
-  }
-
-  onWebSocketFrameSent(requestId: string, opcode: number, data: string) {
-    const ws = this._webSockets.get(requestId);
-    if (ws)
-      ws._frameSent(opcode, data);
-  }
-
-  webSocketFrameReceived(requestId: string, opcode: number, data: string) {
-    const ws = this._webSockets.get(requestId);
-    if (ws)
-      ws._frameReceived(opcode, data);
-  }
-
-  webSocketClosed(requestId: string) {
-    const ws = this._webSockets.get(requestId);
-    if (ws)
-      ws._closed();
-    this._webSockets.delete(requestId);
-  }
-
-  webSocketError(requestId: string, errorMessage: string): void {
-    const ws = this._webSockets.get(requestId);
-    if (ws)
-      ws._error(errorMessage);
-  }
-
-  provisionalLoadFailed(documentId: string, error: string) {
-    for (const watcher of this._lifecycleWatchers)
-      watcher._onProvisionalLoadFailed(documentId, error);
+  removeChildFramesRecursively(frame: Frame) {
+    for (const child of frame.childFrames())
+      this._removeFramesRecursively(child);
   }
 
   private _removeFramesRecursively(frame: Frame) {
-    for (const child of frame.childFrames())
-      this._removeFramesRecursively(child);
+    this.removeChildFramesRecursively(frame);
     frame._onDetached();
     this._frames.delete(frame._id);
-    for (const watcher of this._lifecycleWatchers)
-      watcher._onFrameDetached(frame);
     this._page.emit(Events.Page.FrameDetached, frame);
   }
 
   private _inflightRequestFinished(request: network.Request) {
     const frame = request.frame();
-    if (!frame || request._isFavicon)
+    if (request._isFavicon)
       return;
     if (!frame._inflightRequests.has(request))
       return;
     frame._inflightRequests.delete(request);
     if (frame._inflightRequests.size === 0)
-      this._startNetworkIdleTimer(frame, 'networkidle0');
-    if (frame._inflightRequests.size === 2)
-      this._startNetworkIdleTimer(frame, 'networkidle2');
+      frame._startNetworkIdleTimer();
   }
 
   private _inflightRequestStarted(request: network.Request) {
     const frame = request.frame();
-    if (!frame || request._isFavicon)
+    if (request._isFavicon)
       return;
     frame._inflightRequests.add(request);
     if (frame._inflightRequests.size === 1)
-      this._stopNetworkIdleTimer(frame, 'networkidle0');
-    if (frame._inflightRequests.size === 3)
-      this._stopNetworkIdleTimer(frame, 'networkidle2');
+      frame._stopNetworkIdleTimer();
   }
 
-  private _startNetworkIdleTimer(frame: Frame, event: LifecycleEvent) {
-    assert(!frame._networkIdleTimers.has(event));
-    if (frame._firedLifecycleEvents.has(event))
-      return;
-    frame._networkIdleTimers.set(event, setTimeout(() => {
-      this.frameLifecycleEvent(frame._id, event);
-    }, 500));
-  }
-
-  private _stopNetworkIdleTimer(frame: Frame, event: LifecycleEvent) {
-    const timeoutId = frame._networkIdleTimers.get(event);
-    if (timeoutId)
-      clearTimeout(timeoutId);
-    frame._networkIdleTimers.delete(event);
+  interceptConsoleMessage(message: ConsoleMessage): boolean {
+    if (message.type() !== 'debug')
+      return false;
+    const tag = message.text();
+    const handler = this._consoleMessageTags.get(tag);
+    if (!handler)
+      return false;
+    this._consoleMessageTags.delete(tag);
+    handler();
+    return true;
   }
 }
 
 export class Frame {
   _id: string;
-  readonly _firedLifecycleEvents: Set<LifecycleEvent>;
-  _lastDocumentId: string;
+  readonly _firedLifecycleEvents: Set<types.LifecycleEvent>;
+  _lastDocumentId = '';
+  _pendingDocumentId = '';
+  _frameTasks = new Set<FrameTask>();
   readonly _page: Page;
   private _parentFrame: Frame | null;
   _url = '';
@@ -344,14 +318,18 @@ export class Frame {
   private _childFrames = new Set<Frame>();
   _name = '';
   _inflightRequests = new Set<network.Request>();
-  readonly _networkIdleTimers = new Map<LifecycleEvent, NodeJS.Timer>();
+  private _networkIdleTimer: NodeJS.Timer | undefined;
+  private _setContentCounter = 0;
+  readonly _detachedPromise: Promise<void>;
+  private _detachedCallback = () => {};
 
   constructor(page: Page, id: string, parentFrame: Frame | null) {
     this._id = id;
     this._firedLifecycleEvents = new Set();
-    this._lastDocumentId = '';
     this._page = page;
     this._parentFrame = parentFrame;
+
+    this._detachedPromise = new Promise<void>(x => this._detachedCallback = x);
 
     this._contextData.set('main', { contextPromise: new Promise(() => {}), contextResolveCallback: () => {}, context: null, rerunnableTasks: new Set() });
     this._contextData.set('utility', { contextPromise: new Promise(() => {}), contextResolveCallback: () => {}, context: null, rerunnableTasks: new Set() });
@@ -362,68 +340,62 @@ export class Frame {
       this._parentFrame._childFrames.add(this);
   }
 
-  async goto(url: string, options?: GotoOptions): Promise<network.Response | null> {
-    let referer = (this._page._state.extraHTTPHeaders || {})['referer'];
-    if (options && options.referer !== undefined) {
+  async goto(url: string, options: GotoOptions = {}): Promise<network.Response | null> {
+    const headers = (this._page._state.extraHTTPHeaders || {});
+    let referer = headers['referer'] || headers['Referer'];
+    if (options.referer !== undefined) {
       if (referer !== undefined && referer !== options.referer)
         throw new Error('"referer" is already specified as extra HTTP header');
       referer = options.referer;
     }
-    const watcher = new LifecycleWatcher(this, options, false /* supportUrlMatch */);
+    url = helper.completeUserURL(url);
 
-    let navigateResult: GotoResult;
-    const navigate = async () => {
-      try {
-        navigateResult = await this._page._delegate.navigateFrame(this, url, referer);
-      } catch (error) {
-        return error;
-      }
-    };
-
-    let error = await Promise.race([
-      navigate(),
-      watcher.timeoutOrTerminationPromise,
-    ]);
-    if (!error) {
-      const promises = [watcher.timeoutOrTerminationPromise];
-      if (navigateResult!.newDocumentId) {
-        watcher.setExpectedDocumentId(navigateResult!.newDocumentId, url);
-        promises.push(watcher.newDocumentNavigationPromise);
-      } else if (navigateResult!.isSameDocument) {
-        promises.push(watcher.sameDocumentNavigationPromise);
-      } else {
-        promises.push(watcher.sameDocumentNavigationPromise, watcher.newDocumentNavigationPromise);
-      }
-      error = await Promise.race(promises);
+    const frameTask = new FrameTask(this, options, url);
+    const sameDocumentPromise = frameTask.waitForSameDocumentNavigation();
+    const navigateResult = await frameTask.raceAgainstFailures(this._page._delegate.navigateFrame(this, url, referer)).catch(e => {
+      // Do not leave sameDocumentPromise unhandled.
+      sameDocumentPromise.catch(e => {});
+      throw e;
+    });
+    if (navigateResult.newDocumentId) {
+      // Do not leave sameDocumentPromise unhandled.
+      sameDocumentPromise.catch(e => {});
+      await frameTask.waitForSpecificDocument(navigateResult.newDocumentId);
+    } else {
+      await sameDocumentPromise;
     }
-    watcher.dispose();
-    if (error)
-      throw error;
-    return watcher.navigationResponse();
+    const request = (navigateResult && navigateResult.newDocumentId) ? frameTask.request(navigateResult.newDocumentId) : null;
+    await frameTask.waitForLifecycle(options.waitUntil === undefined ? 'load' : options.waitUntil);
+    frameTask.done();
+    return request ? request._finalRequest().response() : null;
   }
 
-  async waitForNavigation(options?: WaitForNavigationOptions): Promise<network.Response | null> {
-    const watcher = new LifecycleWatcher(this, options, true /* supportUrlMatch */);
-    const error = await Promise.race([
-      watcher.timeoutOrTerminationPromise,
-      watcher.sameDocumentNavigationPromise,
-      watcher.newDocumentNavigationPromise,
-    ]);
-    watcher.dispose();
-    if (error)
-      throw error;
-    return watcher.navigationResponse();
+  async waitForNavigation(options: types.WaitForNavigationOptions = {}): Promise<network.Response | null> {
+    return this._waitForNavigation(options);
   }
 
-  async waitForLoadState(options?: NavigateOptions): Promise<void> {
-    const watcher = new LifecycleWatcher(this, options, false /* supportUrlMatch */);
-    const error = await Promise.race([
-      watcher.timeoutOrTerminationPromise,
-      watcher.lifecyclePromise
+  async _waitForNavigation(options: types.ExtendedWaitForNavigationOptions = {}): Promise<network.Response | null> {
+    const frameTask = new FrameTask(this, options);
+    let documentId: string | undefined;
+    await Promise.race([
+      frameTask.waitForNewDocument(options.url).then(id => documentId = id),
+      frameTask.waitForSameDocumentNavigation(options.url),
     ]);
-    watcher.dispose();
-    if (error)
-      throw error;
+    const request = documentId ? frameTask.request(documentId) : null;
+    if (options.waitUntil !== 'commit')
+      await frameTask.waitForLifecycle(options.waitUntil === undefined ? 'load' : options.waitUntil);
+    frameTask.done();
+    return request ? request._finalRequest().response() : null;
+  }
+
+  async waitForLoadState(state: types.LifecycleEvent = 'load', options: types.TimeoutOptions = {}): Promise<void> {
+    const frameTask = new FrameTask(this, options);
+    await frameTask.waitForLifecycle(state);
+    frameTask.done();
+  }
+
+  async frameElement(): Promise<dom.ElementHandle> {
+    return this._page._delegate.getFrameElement(this);
   }
 
   _context(contextType: ContextType): Promise<dom.FrameExecutionContext> {
@@ -440,66 +412,86 @@ export class Frame {
     return this._context('utility');
   }
 
-  evaluateHandle: types.EvaluateHandle = async (pageFunction, ...args) => {
+  async evaluateHandle<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg): Promise<types.SmartHandle<R>>;
+  async evaluateHandle<R>(pageFunction: types.Func1<void, R>, arg?: any): Promise<types.SmartHandle<R>>;
+  async evaluateHandle<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg): Promise<types.SmartHandle<R>> {
+    assertMaxArguments(arguments.length, 2);
     const context = await this._mainContext();
-    return context.evaluateHandle(pageFunction, ...args as any);
+    return context.evaluateHandleInternal(pageFunction, arg);
   }
 
-  evaluate: types.Evaluate = async (pageFunction, ...args) => {
+  async evaluate<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg): Promise<R>;
+  async evaluate<R>(pageFunction: types.Func1<void, R>, arg?: any): Promise<R>;
+  async evaluate<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg): Promise<R> {
+    assertMaxArguments(arguments.length, 2);
     const context = await this._mainContext();
-    return context.evaluate(pageFunction, ...args as any);
+    return context.evaluateInternal(pageFunction, arg);
   }
 
   async $(selector: string): Promise<dom.ElementHandle<Element> | null> {
-    const utilityContext = await this._utilityContext();
+    return selectors._query(this, selector);
+  }
+
+  async waitForSelector(selector: string, options?: types.WaitForElementOptions): Promise<dom.ElementHandle<Element> | null> {
+    if (options && (options as any).visibility)
+      throw new Error('options.visibility is not supported, did you mean options.waitFor?');
+    const { waitFor = 'attached' } = (options || {});
+    if (!['attached', 'detached', 'visible', 'hidden'].includes(waitFor))
+      throw new Error(`Unsupported waitFor option "${waitFor}"`);
+
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    const { world, task } = selectors._waitForSelectorTask(selector, waitFor, deadline);
+    const result = await this._scheduleRerunnableTask(task, world, deadline, `selector "${selectorToString(selector, waitFor)}"`);
+    if (!result.asElement()) {
+      result.dispose();
+      return null;
+    }
+    const handle = result.asElement() as dom.ElementHandle<Element>;
     const mainContext = await this._mainContext();
-    const handle = await utilityContext._$(selector);
     if (handle && handle._context !== mainContext) {
-      const adopted = this._page._delegate.adoptElementHandle(handle, mainContext);
-      await handle.dispose();
+      const adopted = await this._page._delegate.adoptElementHandle(handle, mainContext);
+      handle.dispose();
       return adopted;
     }
     return handle;
   }
 
-  async waitForSelector(selector: string, options?: types.TimeoutOptions & { visibility?: types.Visibility }): Promise<dom.ElementHandle<Element> | null> {
-    const { timeout = this._page._timeoutSettings.timeout(), visibility = 'any' } = (options || {});
-    const handle = await this._waitForSelectorInUtilityContext(selector, visibility, timeout);
-    const mainContext = await this._mainContext();
-    if (handle && handle._context !== mainContext) {
-      const adopted = this._page._delegate.adoptElementHandle(handle, mainContext);
-      await handle.dispose();
-      return adopted;
-    }
-    return handle;
+  async dispatchEvent(selector: string, type: string, eventInit?: Object, options?: types.TimeoutOptions): Promise<void> {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    const task = selectors._dispatchEventTask(selector, type, eventInit || {}, deadline);
+    const result = await this._scheduleRerunnableTask(task, 'main', deadline, `selector "${selectorToString(selector, 'attached')}"`);
+    result.dispose();
   }
 
-  $eval: types.$Eval = async (selector, pageFunction, ...args) => {
-    const context = await this._mainContext();
-    const elementHandle = await context._$(selector);
-    if (!elementHandle)
+  async $eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element, Arg, R>, arg: Arg): Promise<R>;
+  async $eval<R>(selector: string, pageFunction: types.FuncOn<Element, void, R>, arg?: any): Promise<R>;
+  async $eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element, Arg, R>, arg: Arg): Promise<R> {
+    assertMaxArguments(arguments.length, 3);
+    const handle = await this.$(selector);
+    if (!handle)
       throw new Error(`Error: failed to find element matching selector "${selector}"`);
-    const result = await elementHandle.evaluate(pageFunction, ...args as any);
-    await elementHandle.dispose();
+    const result = await handle.evaluate(pageFunction, arg);
+    handle.dispose();
     return result;
   }
 
-  $$eval: types.$$Eval = async (selector, pageFunction, ...args) => {
-    const context = await this._mainContext();
-    const arrayHandle = await context._$array(selector);
-    const result = await arrayHandle.evaluate(pageFunction, ...args as any);
-    await arrayHandle.dispose();
+  async $$eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element[], Arg, R>, arg: Arg): Promise<R>;
+  async $$eval<R>(selector: string, pageFunction: types.FuncOn<Element[], void, R>, arg?: any): Promise<R>;
+  async $$eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element[], Arg, R>, arg: Arg): Promise<R> {
+    assertMaxArguments(arguments.length, 3);
+    const arrayHandle = await selectors._queryArray(this, selector);
+    const result = await arrayHandle.evaluate(pageFunction, arg);
+    arrayHandle.dispose();
     return result;
   }
 
   async $$(selector: string): Promise<dom.ElementHandle<Element>[]> {
-    const context = await this._mainContext();
-    return context._$$(selector);
+    return selectors._queryAll(this, selector);
   }
 
   async content(): Promise<string> {
     const context = await this._utilityContext();
-    return context.evaluate(() => {
+    return context.evaluateInternal(() => {
       let retVal = '';
       if (document.doctype)
         retVal = new XMLSerializer().serializeToString(document.doctype);
@@ -509,26 +501,24 @@ export class Frame {
     });
   }
 
-  async setContent(html: string, options?: NavigateOptions): Promise<void> {
+  async setContent(html: string, options?: types.NavigateOptions): Promise<void> {
+    const tag = `--playwright--set--content--${this._id}--${++this._setContentCounter}--`;
     const context = await this._utilityContext();
-    if (this._page._delegate.needsLifecycleResetOnSetContent()) {
-      this._page._frameManager.frameLifecycleEvent(this._id, 'clear');
-      this._page._frameManager.clearInflightRequests(this);
-    }
-    await context.evaluate(html => {
+    const lifecyclePromise = new Promise((resolve, reject) => {
+      this._page._frameManager._consoleMessageTags.set(tag, () => {
+        // Clear lifecycle right after document.open() - see 'tag' below.
+        this._page._frameManager.clearFrameLifecycle(this);
+        this.waitForLoadState(options ? options.waitUntil : 'load', options).then(resolve).catch(reject);
+      });
+    });
+    const contentPromise = context.evaluateInternal(({ html, tag }) => {
       window.stop();
       document.open();
+      console.debug(tag);  // eslint-disable-line no-console
       document.write(html);
       document.close();
-    }, html);
-    const watcher = new LifecycleWatcher(this, options, false /* supportUrlMatch */);
-    const error = await Promise.race([
-      watcher.timeoutOrTerminationPromise,
-      watcher.lifecyclePromise,
-    ]);
-    watcher.dispose();
-    if (error)
-      throw error;
+    }, { html, tag });
+    await Promise.all([contentPromise, lifecyclePromise]);
   }
 
   name(): string {
@@ -568,33 +558,40 @@ export class Frame {
     const context = await this._mainContext();
     return this._raceWithCSPError(async () => {
       if (url !== null)
-        return (await context.evaluateHandle(addScriptUrl, url, type)).asElement()!;
+        return (await context.evaluateHandleInternal(addScriptUrl, { url, type })).asElement()!;
+      let result;
       if (path !== null) {
-        let contents = await platform.readFileAsync(path, 'utf8');
+        let contents = await util.promisify(fs.readFile)(path, 'utf8');
         contents += '//# sourceURL=' + path.replace(/\n/g, '');
-        return (await context.evaluateHandle(addScriptContent, contents, type)).asElement()!;
+        result = (await context.evaluateHandleInternal(addScriptContent, { content: contents, type })).asElement()!;
+      } else {
+        result = (await context.evaluateHandleInternal(addScriptContent, { content: content!, type })).asElement()!;
       }
-      return (await context.evaluateHandle(addScriptContent, content!, type)).asElement()!;
+      // Another round trip to the browser to ensure that we receive CSP error messages
+      // (if any) logged asynchronously in a separate task on the content main thread.
+      if (this._page._delegate.cspErrorsAsynchronousForInlineScipts)
+        await context.evaluateInternal(() => true);
+      return result;
     });
 
-    async function addScriptUrl(url: string, type: string): Promise<HTMLElement> {
+    async function addScriptUrl(options: { url: string, type: string }): Promise<HTMLElement> {
       const script = document.createElement('script');
-      script.src = url;
-      if (type)
-        script.type = type;
+      script.src = options.url;
+      if (options.type)
+        script.type = options.type;
       const promise = new Promise((res, rej) => {
         script.onload = res;
-        script.onerror = rej;
+        script.onerror = e => rej(typeof e === 'string' ? new Error(e) : new Error(`Failed to load script at ${script.src}`));
       });
       document.head.appendChild(script);
       await promise;
       return script;
     }
 
-    function addScriptContent(content: string, type: string = 'text/javascript'): HTMLElement {
+    function addScriptContent(options: { content: string, type: string }): HTMLElement {
       const script = document.createElement('script');
-      script.type = type;
-      script.text = content;
+      script.type = options.type || 'text/javascript';
+      script.text = options.content;
       let error = null;
       script.onerror = e => error = e;
       document.head.appendChild(script);
@@ -616,15 +613,15 @@ export class Frame {
     const context = await this._mainContext();
     return this._raceWithCSPError(async () => {
       if (url !== null)
-        return (await context.evaluateHandle(addStyleUrl, url)).asElement()!;
+        return (await context.evaluateHandleInternal(addStyleUrl, url)).asElement()!;
 
       if (path !== null) {
-        let contents = await platform.readFileAsync(path, 'utf8');
+        let contents = await util.promisify(fs.readFile)(path, 'utf8');
         contents += '/*# sourceURL=' + path.replace(/\n/g, '') + '*/';
-        return (await context.evaluateHandle(addStyleContent, contents)).asElement()!;
+        return (await context.evaluateHandleInternal(addStyleContent, contents)).asElement()!;
       }
 
-      return (await context.evaluateHandle(addStyleContent, content!)).asElement()!;
+      return (await context.evaluateHandleInternal(addStyleContent, content!)).asElement()!;
     });
 
     async function addStyleUrl(url: string): Promise<HTMLElement> {
@@ -684,117 +681,117 @@ export class Frame {
     return result!;
   }
 
-  async click(selector: string, options?: WaitForOptions & ClickOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.click(options);
-    await handle.dispose();
-  }
-
-  async dblclick(selector: string, options?: WaitForOptions & MultiClickOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.dblclick(options);
-    await handle.dispose();
-  }
-
-  async tripleclick(selector: string, options?: WaitForOptions & MultiClickOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.tripleclick(options);
-    await handle.dispose();
-  }
-
-  async fill(selector: string, value: string, options?: WaitForOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.fill(value);
-    await handle.dispose();
-  }
-
-  async focus(selector: string, options?: WaitForOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.focus();
-    await handle.dispose();
-  }
-
-  async hover(selector: string, options?: WaitForOptions & PointerActionOptions) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.hover(options);
-    await handle.dispose();
-  }
-
-  async select(selector: string, value: string | dom.ElementHandle | types.SelectOption | string[] | dom.ElementHandle[] | types.SelectOption[] | undefined, options?: WaitForOptions): Promise<string[]> {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
-    const result = await handle.select(...values);
-    await handle.dispose();
-    return result;
-  }
-
-  async type(selector: string, text: string, options?: WaitForOptions & { delay?: number }) {
-    const handle = await this._optionallyWaitForSelectorInUtilityContext(selector, options);
-    await handle.type(text, options);
-    await handle.dispose();
-  }
-
-  async waitFor(selectorOrFunctionOrTimeout: (string | number | Function), options: types.WaitForFunctionOptions & { visibility?: types.Visibility } = {}, ...args: any[]): Promise<js.JSHandle | null> {
-    if (helper.isString(selectorOrFunctionOrTimeout))
-      return this.waitForSelector(selectorOrFunctionOrTimeout as string, options) as any;
-    if (helper.isNumber(selectorOrFunctionOrTimeout))
-      return new Promise(fulfill => setTimeout(fulfill, selectorOrFunctionOrTimeout as number));
-    if (typeof selectorOrFunctionOrTimeout === 'function')
-      return this.waitForFunction(selectorOrFunctionOrTimeout, options, ...args);
-    return Promise.reject(new Error('Unsupported target type: ' + (typeof selectorOrFunctionOrTimeout)));
-  }
-
-  private async _optionallyWaitForSelectorInUtilityContext(selector: string, options: WaitForOptions | undefined): Promise<dom.ElementHandle<Element>> {
-    const { timeout = this._page._timeoutSettings.timeout(), waitFor = 'visible' } = (options || {});
-    let handle: dom.ElementHandle<Element>;
-    if (waitFor !== 'nowait') {
-      const maybeHandle = await this._waitForSelectorInUtilityContext(selector, waitFor, timeout);
-      if (!maybeHandle)
-        throw new Error('No node found for selector: ' + selectorToString(selector, waitFor));
-      handle = maybeHandle;
-    } else {
-      const context = await this._context('utility');
-      const maybeHandle = await context._$(selector);
-      assert(maybeHandle, 'No node found for selector: ' + selector);
-      handle = maybeHandle!;
+  private async _retryWithSelectorIfNotConnected<R>(
+    selector: string, options: types.TimeoutOptions,
+    action: (handle: dom.ElementHandle<Element>, deadline: number) => Promise<R>): Promise<R> {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    while (!helper.isPastDeadline(deadline)) {
+      try {
+        const { world, task } = selectors._waitForSelectorTask(selector, 'attached', deadline);
+        const handle = await this._scheduleRerunnableTask(task, world, deadline, `selector "${selector}"`);
+        const element = handle.asElement() as dom.ElementHandle<Element>;
+        try {
+          return await action(element, deadline);
+        } finally {
+          element.dispose();
+        }
+      } catch (e) {
+        if (!(e instanceof NotConnectedError))
+          throw e;
+        this._page._log(dom.inputLog, 'Element was detached from the DOM, retrying');
+      }
     }
-    return handle;
+    throw new TimeoutError(`waiting for selector "${selector}" failed: timeout exceeded`);
   }
 
-  private async _waitForSelectorInUtilityContext(selector: string, waitFor: types.Visibility, timeout: number): Promise<dom.ElementHandle<Element> | null> {
-    let visibility: types.Visibility = 'any';
-    if (waitFor === 'visible' || waitFor === 'hidden' || waitFor === 'any')
-      visibility = waitFor;
+  async click(selector: string, options: dom.ClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.click(helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async dblclick(selector: string, options: dom.MultiClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.dblclick(helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async fill(selector: string, value: string, options: types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.fill(value, helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async focus(selector: string, options: types.TimeoutOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.focus());
+  }
+
+  async hover(selector: string, options: dom.PointerActionOptions & types.PointerActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.hover(helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async selectOption(selector: string, values: string | dom.ElementHandle | types.SelectOption | string[] | dom.ElementHandle[] | types.SelectOption[], options: types.NavigatingActionWaitOptions = {}): Promise<string[]> {
+    return await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.selectOption(values, helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async setInputFiles(selector: string, files: string | types.FilePayload | string[] | types.FilePayload[], options: types.NavigatingActionWaitOptions = {}): Promise<void> {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.setInputFiles(files, helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async type(selector: string, text: string, options: { delay?: number } & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.type(text, helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async press(selector: string, key: string, options: { delay?: number } & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.press(key, helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async check(selector: string, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.check(helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async uncheck(selector: string, options: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}) {
+    await this._retryWithSelectorIfNotConnected(selector, options,
+        (handle, deadline) => handle.uncheck(helper.optionsWithUpdatedTimeout(options, deadline)));
+  }
+
+  async waitForTimeout(timeout: number) {
+    waitForTimeoutWasUsed(this._page);
+    await new Promise(fulfill => setTimeout(fulfill, timeout));
+  }
+
+  async waitForFunction<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg, options?: types.WaitForFunctionOptions): Promise<types.SmartHandle<R>>;
+  async waitForFunction<R>(pageFunction: types.Func1<void, R>, arg?: any, options?: types.WaitForFunctionOptions): Promise<types.SmartHandle<R>>;
+  async waitForFunction<R, Arg>(pageFunction: types.Func1<Arg, R>, arg: Arg, options: types.WaitForFunctionOptions = {}): Promise<types.SmartHandle<R>> {
+    const { polling = 'raf' } = options;
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    if (helper.isString(polling))
+      assert(polling === 'raf', 'Unknown polling option: ' + polling);
+    else if (helper.isNumber(polling))
+      assert(polling > 0, 'Cannot poll with non-positive interval: ' + polling);
     else
-      throw new Error(`Unsupported waitFor option "${waitFor}"`);
-    const task = dom.waitForSelectorTask(selector, visibility, timeout);
-    const result = await this._scheduleRerunnableTask(task, 'utility', timeout, `selector "${selectorToString(selector, visibility)}"`);
-    if (!result.asElement()) {
-      await result.dispose();
-      return null;
-    }
-    return result.asElement() as dom.ElementHandle<Element>;
-  }
+      throw new Error('Unknown polling options: ' + polling);
+    const predicateBody = helper.isString(pageFunction) ? 'return (' + pageFunction + ')' : 'return (' + pageFunction + ')(arg)';
 
-  async waitForFunction(pageFunction: Function | string, options?: types.WaitForFunctionOptions, ...args: any[]): Promise<js.JSHandle> {
-    options = { timeout: this._page._timeoutSettings.timeout(), ...(options || {}) };
-    const task = dom.waitForFunctionTask(undefined, pageFunction, options, ...args);
-    return this._scheduleRerunnableTask(task, 'main', options.timeout);
-  }
-
-  $wait: types.$Wait = async (selector, pageFunction, options, ...args) => {
-    options = { timeout: this._page._timeoutSettings.timeout(), ...(options || {}) };
-    const task = dom.waitForFunctionTask(selector, pageFunction, options, ...args);
-    return this._scheduleRerunnableTask(task, 'main', options.timeout) as any;
+    const task = async (context: dom.FrameExecutionContext) => context.evaluateHandleInternal(({ injected, predicateBody, polling, timeout, arg }) => {
+      const innerPredicate = new Function('arg', predicateBody);
+      return injected.poll(polling, timeout, () => innerPredicate(arg));
+    }, { injected: await context._injected(), predicateBody, polling, timeout: helper.timeUntilDeadline(deadline), arg });
+    return this._scheduleRerunnableTask(task, 'main', deadline) as any as types.SmartHandle<R>;
   }
 
   async title(): Promise<string> {
     const context = await this._utilityContext();
-    return context.evaluate(() => document.title);
+    return context.evaluateInternal(() => document.title);
   }
 
   _onDetached() {
     this._detached = true;
+    this._detachedCallback();
     for (const data of this._contextData.values()) {
       for (const rerunnableTask of data.rerunnableTasks)
         rerunnableTask.terminate(new Error('waitForFunction failed: frame got detached.'));
@@ -804,9 +801,9 @@ export class Frame {
     this._parentFrame = null;
   }
 
-  private _scheduleRerunnableTask(task: dom.Task, contextType: ContextType, timeout?: number, title?: string): Promise<js.JSHandle> {
+  private _scheduleRerunnableTask(task: Task, contextType: ContextType, deadline: number, title?: string): Promise<js.JSHandle> {
     const data = this._contextData.get(contextType)!;
-    const rerunnableTask = new RerunnableTask(data, task, timeout, title);
+    const rerunnableTask = new RerunnableTask(data, task, deadline, title);
     data.rerunnableTasks.add(rerunnableTask);
     if (data.context)
       rerunnableTask.rerun(data.context);
@@ -843,19 +840,34 @@ export class Frame {
         this._setContext(contextType, null);
     }
   }
+
+  _startNetworkIdleTimer() {
+    assert(!this._networkIdleTimer);
+    if (this._firedLifecycleEvents.has('networkidle'))
+      return;
+    this._networkIdleTimer = setTimeout(() => { this._page._frameManager.frameLifecycleEvent(this._id, 'networkidle'); }, 500);
+  }
+
+  _stopNetworkIdleTimer() {
+    if (this._networkIdleTimer)
+      clearTimeout(this._networkIdleTimer);
+    this._networkIdleTimer = undefined;
+  }
 }
+
+type Task = (context: dom.FrameExecutionContext) => Promise<js.JSHandle>;
 
 class RerunnableTask {
   readonly promise: Promise<js.JSHandle>;
   private _contextData: ContextData;
-  private _task: dom.Task;
+  private _task: Task;
   private _runCount: number;
   private _resolve: (result: js.JSHandle) => void = () => {};
   private _reject: (reason: Error) => void = () => {};
   private _timeoutTimer?: NodeJS.Timer;
   private _terminated = false;
 
-  constructor(data: ContextData, task: dom.Task, timeout?: number, title?: string) {
+  constructor(data: ContextData, task: Task, deadline: number, title?: string) {
     this._contextData = data;
     this._task = task;
     this._runCount = 0;
@@ -865,10 +877,8 @@ class RerunnableTask {
     });
     // Since page navigation requires us to re-install the pageScript, we should track
     // timeout on our end.
-    if (timeout) {
-      const timeoutError = new TimeoutError(`waiting for ${title || 'function'} failed: timeout ${timeout}ms exceeded`);
-      this._timeoutTimer = setTimeout(() => this.terminate(timeoutError), timeout);
-    }
+    const timeoutError = new TimeoutError(`waiting for ${title || 'function'} failed: timeout exceeded`);
+    this._timeoutTimer = setTimeout(() => this.terminate(timeoutError), helper.timeUntilDeadline(deadline));
   }
 
   terminate(error: Error) {
@@ -889,15 +899,15 @@ class RerunnableTask {
 
     if (this._terminated || runCount !== this._runCount) {
       if (success)
-        await success.dispose();
+        success.dispose();
       return;
     }
 
     // Ignore timeouts in pageScript - we track timeouts ourselves.
     // If execution context has been already destroyed, `context.evaluate` will
     // throw an error - ignore this predicate run altogether.
-    if (!error && await context.evaluate(s => !s, success).catch(e => true)) {
-      await success!.dispose();
+    if (!error && await context.evaluateInternal(s => !s, success).catch(e => true)) {
+      success!.dispose();
       return;
     }
 
@@ -926,170 +936,203 @@ class RerunnableTask {
   }
 }
 
-class LifecycleWatcher {
-  readonly sameDocumentNavigationPromise: Promise<Error | null>;
-  readonly lifecyclePromise: Promise<void>;
-  readonly newDocumentNavigationPromise: Promise<Error | null>;
-  readonly timeoutOrTerminationPromise: Promise<Error | null>;
-  private _expectedLifecycle: LifecycleEvent[];
-  private _frame: Frame;
-  private _navigationRequest: network.Request | null = null;
-  private _sameDocumentNavigationCompleteCallback: () => void = () => {};
-  private _lifecycleCallback: () => void = () => {};
-  private _newDocumentNavigationCompleteCallback: () => void = () => {};
-  private _frameDetachedCallback: (err: Error) => void = () => {};
-  private _navigationAbortedCallback: (err: Error) => void = () => {};
-  private _maximumTimer?: NodeJS.Timer;
-  private _hasSameDocumentNavigation = false;
-  private _targetUrl: string | undefined;
-  private _expectedDocumentId: string | undefined;
-  private _urlMatch: types.URLMatch | undefined;
+function selectorToString(selector: string, waitFor: 'attached' | 'detached' | 'visible' | 'hidden'): string {
+  let label;
+  switch (waitFor) {
+    case 'visible': label = '[visible] '; break;
+    case 'hidden': label = '[hidden] '; break;
+    case 'attached': label = ''; break;
+    case 'detached': label = '[detached]'; break;
+  }
+  return `${label}${selector}`;
+}
 
-  constructor(frame: Frame, options: WaitForNavigationOptions | undefined, supportUrlMatch: boolean) {
-    options = options || {};
-    let { waitUntil = 'load' as LifecycleEvent } = options;
-    const { timeout = frame._page._timeoutSettings.navigationTimeout() } = options;
-    if (!Array.isArray(waitUntil))
-      waitUntil = [waitUntil];
-    for (const event of waitUntil) {
-      if (!kLifecycleEvents.has(event))
-        throw new Error(`Unsupported waitUntil option ${String(event)}`);
-    }
-    if (supportUrlMatch)
-      this._urlMatch = options.url;
-    this._expectedLifecycle = waitUntil.slice();
-    this._frame = frame;
-    this.sameDocumentNavigationPromise = new Promise(f => this._sameDocumentNavigationCompleteCallback = f);
-    this.lifecyclePromise = new Promise(f => this._lifecycleCallback = f);
-    this.newDocumentNavigationPromise = new Promise(f => this._newDocumentNavigationCompleteCallback = f);
-    this.timeoutOrTerminationPromise = Promise.race([
-      this._createTimeoutPromise(timeout),
-      new Promise<Error>(f => this._frameDetachedCallback = f),
-      new Promise<Error>(f => this._navigationAbortedCallback = f),
-      this._frame._page._disconnectedPromise.then(() => new Error('Navigation failed because browser has disconnected!')),
-    ]);
-    frame._page._frameManager._lifecycleWatchers.add(this);
-    this._checkLifecycleComplete();
+export class SignalBarrier {
+  private _frameIds = new Map<string, number>();
+  private _options: types.NavigatingActionWaitOptions;
+  private _protectCount = 0;
+  private _expectedPopups = 0;
+  private _promise: Promise<void>;
+  private _promiseCallback = () => {};
+  private _deadline: number;
+
+  constructor(options: types.NavigatingActionWaitOptions, deadline: number) {
+    this._options = options;
+    this._deadline = deadline;
+    this._promise = new Promise(f => this._promiseCallback = f);
+    this.retain();
   }
 
-  _urlMatches(urlString: string): boolean {
-    return !this._urlMatch || platform.urlMatches(urlString, this._urlMatch);
+  waitFor(): Promise<void> {
+    this.release();
+    return this._promise;
   }
 
-  setExpectedDocumentId(documentId: string, url: string) {
-    assert(!this._urlMatch, 'Should not have url match when expecting a particular navigation');
-    this._expectedDocumentId = documentId;
-    this._targetUrl = url;
-    if (this._navigationRequest && this._navigationRequest._documentId !== documentId)
-      this._navigationRequest = null;
+  async addFrameNavigation(frame: Frame) {
+    this.retain();
+    const options = helper.optionsWithUpdatedTimeout(this._options, this._deadline);
+    await frame._waitForNavigation({...options, waitUntil: 'commit'}).catch(e => {});
+    this.release();
   }
 
-  _onFrameDetached(frame: Frame) {
-    if (this._frame === frame) {
-      this._frameDetachedCallback.call(null, new Error('Navigating frame was detached'));
-      return;
-    }
-    this._checkLifecycleComplete();
+  async expectPopup() {
+    ++this._expectedPopups;
   }
 
-  _onNavigatedWithinDocument(frame: Frame) {
-    if (frame !== this._frame)
-      return;
-    this._hasSameDocumentNavigation = true;
-    this._checkLifecycleComplete();
+  async unexpectPopup() {
+    --this._expectedPopups;
+    this._maybeResolve();
   }
 
-  _onNavigationRequest(frame: Frame, request: network.Request) {
-    assert(request._documentId);
-    if (frame !== this._frame || !this._urlMatches(request.url()))
-      return;
-    if (this._expectedDocumentId === undefined || this._expectedDocumentId === request._documentId) {
-      this._navigationRequest = request;
-      this._expectedDocumentId = request._documentId;
-      this._targetUrl = request.url();
-    }
+  async addPopup(pageOrError: Promise<Page | Error>) {
+    if (this._expectedPopups)
+      --this._expectedPopups;
+    this.retain();
+    await pageOrError;
+    this.release();
   }
 
-  _onCommittedNewDocumentNavigation(frame: Frame) {
-    if (frame === this._frame && this._expectedDocumentId !== undefined && this._navigationRequest &&
-        frame._lastDocumentId !== this._expectedDocumentId) {
-      this._navigationAbortedCallback(new Error('Navigation to ' + this._targetUrl + ' was canceled by another one'));
-      return;
-    }
-    if (frame === this._frame && this._expectedDocumentId === undefined && this._urlMatches(frame.url())) {
-      this._expectedDocumentId = frame._lastDocumentId;
-      this._targetUrl = frame.url();
-    }
+  retain() {
+    ++this._protectCount;
   }
 
-  _onAbortedNewDocumentNavigation(frame: Frame, documentId: string, errorText: string) {
-    if (frame === this._frame && documentId === this._expectedDocumentId) {
-      if (this._targetUrl)
-        this._navigationAbortedCallback(new Error('Navigation to ' + this._targetUrl + ' failed: ' + errorText));
-      else
-        this._navigationAbortedCallback(new Error('Navigation failed: ' + errorText));
-    }
+  release() {
+    --this._protectCount;
+    this._maybeResolve();
   }
 
-  _onProvisionalLoadFailed(documentId: string, error: string) {
-    this._onAbortedNewDocumentNavigation(this._frame, documentId, error);
-  }
-
-  _onLifecycleEvent(frame: Frame) {
-    this._checkLifecycleComplete();
-  }
-
-  async navigationResponse(): Promise<network.Response | null> {
-    return this._navigationRequest ? this._navigationRequest._finalRequest._waitForFinished() : null;
-  }
-
-  private _createTimeoutPromise(timeout: number): Promise<Error | null> {
-    if (!timeout)
-      return new Promise(() => {});
-    const errorMessage = 'Navigation timeout of ' + timeout + ' ms exceeded';
-    return new Promise(fulfill => this._maximumTimer = setTimeout(fulfill, timeout))
-        .then(() => new TimeoutError(errorMessage));
-  }
-
-  private _checkLifecycleRecursively(frame: Frame, expectedLifecycle: LifecycleEvent[]): boolean {
-    for (const event of expectedLifecycle) {
-      if (!frame._firedLifecycleEvents.has(event))
-        return false;
-    }
-    for (const child of frame.childFrames()) {
-      if (!this._checkLifecycleRecursively(child, expectedLifecycle))
-        return false;
-    }
-    return true;
-  }
-
-  private _checkLifecycleComplete() {
-    if (!this._checkLifecycleRecursively(this._frame, this._expectedLifecycle))
-      return;
-    if (this._urlMatches(this._frame.url())) {
-      this._lifecycleCallback();
-      if (this._hasSameDocumentNavigation)
-        this._sameDocumentNavigationCompleteCallback();
-    }
-    if (this._frame._lastDocumentId === this._expectedDocumentId)
-      this._newDocumentNavigationCompleteCallback();
-  }
-
-  dispose() {
-    this._frame._page._frameManager._lifecycleWatchers.delete(this);
-    if (this._maximumTimer)
-      clearTimeout(this._maximumTimer);
+  private async _maybeResolve() {
+    if (!this._protectCount && !this._expectedPopups && !this._frameIds.size)
+      this._promiseCallback();
   }
 }
 
-function selectorToString(selector: string, visibility: types.Visibility): string {
-  let label;
-  switch (visibility) {
-    case 'visible': label = '[visible] '; break;
-    case 'hidden': label = '[hidden] '; break;
-    case 'any':
-    case undefined:
-      label = ''; break;
+export class FrameTask {
+  private _frame: Frame;
+  private _failurePromise: Promise<Error>;
+  private _requestMap = new Map<string, network.Request>();
+  private _timer?: NodeJS.Timer;
+  private _url: string | undefined;
+
+  onNewDocument: (documentId: string, error?: Error) => void = () => {};
+  onSameDocument = () => {};
+  onLifecycle = () => {};
+
+  constructor(frame: Frame, options: types.TimeoutOptions, url?: string) {
+    this._frame = frame;
+    this._url = url;
+
+    // Process timeouts
+    let timeoutPromise = new Promise<TimeoutError>(() => {});
+    const { timeout = frame._page._timeoutSettings.navigationTimeout() } = options;
+    if (timeout) {
+      const errorMessage = 'Navigation timeout exceeded';
+      timeoutPromise = new Promise(fulfill => this._timer = setTimeout(fulfill, timeout))
+          .then(() => { throw new TimeoutError(errorMessage); });
+    }
+
+    // Process detached frames
+    this._failurePromise = Promise.race([
+      timeoutPromise,
+      this._frame._page._disconnectedPromise.then(() => { throw new Error('Navigation failed because browser has disconnected!'); }),
+      this._frame._detachedPromise.then(() => { throw new Error('Navigating frame was detached!'); }),
+    ]);
+
+    frame._frameTasks.add(this);
   }
-  return `${label}${selector}`;
+
+  onRequest(request: network.Request) {
+    if (!request._documentId || request.redirectedFrom())
+      return;
+    this._requestMap.set(request._documentId, request);
+  }
+
+  async raceAgainstFailures<T>(promise: Promise<T>): Promise<T> {
+    let result: T;
+    let error: Error | undefined;
+    await Promise.race([
+      this._failurePromise.catch(e => error = e),
+      promise.then(r => result = r).catch(e => error = e)
+    ]);
+
+    if (!error)
+      return result!;
+    this.done();
+    if (this._url)
+      error.message = error.message + ` while navigating to ${this._url}`;
+    throw error;
+  }
+
+  request(documentId: string): network.Request | undefined {
+    return this._requestMap.get(documentId);
+  }
+
+  waitForSameDocumentNavigation(url?: types.URLMatch): Promise<void> {
+    return this.raceAgainstFailures(new Promise((resolve, reject) => {
+      this.onSameDocument = () => {
+        if (helper.urlMatches(this._frame.url(), url))
+          resolve();
+      };
+    }));
+  }
+
+  waitForSpecificDocument(expectedDocumentId: string): Promise<void> {
+    return this.raceAgainstFailures(new Promise((resolve, reject) => {
+      this.onNewDocument = (documentId: string, error?: Error) => {
+        if (documentId === expectedDocumentId) {
+          if (!error)
+            resolve();
+          else
+            reject(error);
+        } else if (!error) {
+          reject(new Error('Navigation interrupted by another one'));
+        }
+      };
+    }));
+  }
+
+  waitForNewDocument(url?: types.URLMatch): Promise<string> {
+    return this.raceAgainstFailures(new Promise((resolve, reject) => {
+      this.onNewDocument = (documentId: string, error?: Error) => {
+        if (!error && !helper.urlMatches(this._frame.url(), url))
+          return;
+        if (error)
+          reject(error);
+        else
+          resolve(documentId);
+      };
+    }));
+  }
+
+  waitForLifecycle(waitUntil: types.LifecycleEvent): Promise<void> {
+    if (waitUntil as unknown === 'networkidle0')
+      waitUntil = 'networkidle';
+    if (!types.kLifecycleEvents.has(waitUntil))
+      throw new Error(`Unsupported waitUntil option ${String(waitUntil)}`);
+    return this.raceAgainstFailures(new Promise((resolve, reject) => {
+      this.onLifecycle = () => {
+        if (!checkLifecycleRecursively(this._frame))
+          return;
+        resolve();
+      };
+      this.onLifecycle();
+    }));
+
+    function checkLifecycleRecursively(frame: Frame): boolean {
+      if (!frame._firedLifecycleEvents.has(waitUntil))
+        return false;
+      for (const child of frame.childFrames()) {
+        if (!checkLifecycleRecursively(child))
+          return false;
+      }
+      return true;
+    }
+  }
+
+  done() {
+    this._frame._frameTasks.delete(this);
+    if (this._timer)
+      clearTimeout(this._timer);
+    this._failurePromise.catch(e => {});
+  }
 }

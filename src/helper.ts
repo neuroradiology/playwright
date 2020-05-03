@@ -15,22 +15,26 @@
  * limitations under the License.
  */
 
+import * as crypto from 'crypto';
+import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as util from 'util';
 import { TimeoutError } from './errors';
-import * as platform from './platform';
-
-export const debugError = platform.debug(`pw:error`);
+import * as types from './types';
 
 export type RegisteredListener = {
-  emitter: platform.EventEmitterType;
+  emitter: EventEmitter;
   eventName: (string | symbol);
   handler: (...args: any[]) => void;
 };
 
+export type Listener = (...args: any[]) => void;
+
 class Helper {
   static evaluationString(fun: Function | string, ...args: any[]): string {
     if (Helper.isString(fun)) {
-      assert(args.length === 0, 'Cannot evaluate a string with arguments');
-      return fun as string;
+      assert(args.length === 0 || (args.length === 1 && args[0] === undefined), 'Cannot evaluate a string with arguments');
+      return fun;
     }
     return `(${fun})(${args.map(serializeArgument).join(',')})`;
 
@@ -41,24 +45,31 @@ class Helper {
     }
   }
 
+  static async evaluationScript(fun: Function | string | { path?: string, content?: string }, arg?: any, addSourceUrl: boolean = true): Promise<string> {
+    if (!helper.isString(fun) && typeof fun !== 'function') {
+      if (fun.content !== undefined) {
+        fun = fun.content;
+      } else if (fun.path !== undefined) {
+        let contents = await util.promisify(fs.readFile)(fun.path, 'utf8');
+        if (addSourceUrl)
+          contents += '//# sourceURL=' + fun.path.replace(/\n/g, '');
+        fun = contents;
+      } else {
+        throw new Error('Either path or content property must be present');
+      }
+    }
+    return helper.evaluationString(fun, arg);
+  }
+
   static installApiHooks(className: string, classType: any) {
-    const log = platform.debug('pw:api');
     for (const methodName of Reflect.ownKeys(classType.prototype)) {
       const method = Reflect.get(classType.prototype, methodName);
       if (methodName === 'constructor' || typeof methodName !== 'string' || methodName.startsWith('_') || typeof method !== 'function')
         continue;
       const isAsync = method.constructor.name === 'AsyncFunction';
-      if (!isAsync && !log.enabled)
+      if (!isAsync)
         continue;
       Reflect.set(classType.prototype, methodName, function(this: any, ...args: any[]) {
-        if (log.enabled) {
-          if (args.length)
-            log(`${className}.${methodName} %o`, args);
-          else
-            log(`${className}.${methodName}`);
-        }
-        if (!isAsync)
-          return method.call(this, ...args);
         const syncStack: any = {};
         Error.captureStackTrace(syncStack);
         return method.call(this, ...args).catch((e: any) => {
@@ -73,7 +84,7 @@ class Helper {
   }
 
   static addEventListener(
-    emitter: platform.EventEmitterType,
+    emitter: EventEmitter,
     eventName: (string | symbol),
     handler: (...args: any[]) => void): RegisteredListener {
     emitter.on(eventName, handler);
@@ -81,7 +92,7 @@ class Helper {
   }
 
   static removeEventListeners(listeners: Array<{
-      emitter: platform.EventEmitterType;
+      emitter: EventEmitter;
       eventName: (string | symbol);
       handler: (...args: any[]) => void;
     }>) {
@@ -98,13 +109,24 @@ class Helper {
     return typeof obj === 'number' || obj instanceof Number;
   }
 
+  static isRegExp(obj: any): obj is RegExp {
+    return obj instanceof RegExp || Object.prototype.toString.call(obj) === '[object RegExp]';
+  }
+
+  static isObject(obj: any): obj is NonNullable<object> {
+    return typeof obj === 'object' && obj !== null;
+  }
+
+  static isBoolean(obj: any): obj is boolean {
+    return typeof obj === 'boolean' || obj instanceof Boolean;
+  }
+
   static async waitForEvent(
-    emitter: platform.EventEmitterType,
+    emitter: EventEmitter,
     eventName: (string | symbol),
     predicate: Function,
-    timeout: number,
+    deadline: number,
     abortPromise: Promise<Error>): Promise<any> {
-    let eventTimeout: NodeJS.Timer;
     let resolveCallback: (event: any) => void = () => {};
     let rejectCallback: (error: any) => void = () => {};
     const promise = new Promise((resolve, reject) => {
@@ -120,34 +142,31 @@ class Helper {
         rejectCallback(e);
       }
     });
-    if (timeout) {
-      eventTimeout = setTimeout(() => {
-        rejectCallback(new TimeoutError(`Timeout exceeded while waiting for ${String(eventName)}`));
-      }, timeout);
-    }
+    const eventTimeout = setTimeout(() => {
+      rejectCallback(new TimeoutError(`Timeout exceeded while waiting for ${String(eventName)}`));
+    }, helper.timeUntilDeadline(deadline));
     function cleanup() {
       Helper.removeEventListeners([listener]);
       clearTimeout(eventTimeout);
     }
-    const result = await Promise.race([promise, abortPromise]).then(r => {
+    return await Promise.race([promise, abortPromise]).then(r => {
       cleanup();
       return r;
     }, e => {
       cleanup();
       throw e;
     });
-    if (result instanceof Error)
-      throw result;
-    return result;
   }
 
   static async waitWithTimeout<T>(promise: Promise<T>, taskName: string, timeout: number): Promise<T> {
+    return this.waitWithDeadline(promise, taskName, helper.monotonicTime() + timeout);
+  }
+
+  static async waitWithDeadline<T>(promise: Promise<T>, taskName: string, deadline: number): Promise<T> {
     let reject: (error: Error) => void;
-    const timeoutError = new TimeoutError(`waiting for ${taskName} failed: timeout ${timeout}ms exceeded`);
+    const timeoutError = new TimeoutError(`waiting for ${taskName} failed: timeout exceeded`);
     const timeoutPromise = new Promise<T>((resolve, x) => reject = x);
-    let timeoutTimer = null;
-    if (timeout)
-      timeoutTimer = setTimeout(() => reject(timeoutError), timeout);
+    const timeoutTimer = setTimeout(() => reject(timeoutError), helper.timeUntilDeadline(deadline));
     try {
       return await Promise.race([promise, timeoutPromise]);
     } finally {
@@ -155,11 +174,188 @@ class Helper {
         clearTimeout(timeoutTimer);
     }
   }
+
+  static globToRegex(glob: string): RegExp {
+    const tokens = ['^'];
+    let inGroup;
+    for (let i = 0; i < glob.length; ++i) {
+      const c = glob[i];
+      if (escapeGlobChars.has(c)) {
+        tokens.push('\\' + c);
+        continue;
+      }
+      if (c === '*') {
+        const beforeDeep = glob[i - 1];
+        let starCount = 1;
+        while (glob[i + 1] === '*') {
+          starCount++;
+          i++;
+        }
+        const afterDeep = glob[i + 1];
+        const isDeep = starCount > 1 &&
+            (beforeDeep === '/' || beforeDeep === undefined) &&
+            (afterDeep === '/' || afterDeep === undefined);
+        if (isDeep) {
+          tokens.push('((?:[^/]*(?:\/|$))*)');
+          i++;
+        } else {
+          tokens.push('([^/]*)');
+        }
+        continue;
+      }
+
+      switch (c) {
+        case '?':
+          tokens.push('.');
+          break;
+        case '{':
+          inGroup = true;
+          tokens.push('(');
+          break;
+        case '}':
+          inGroup = false;
+          tokens.push(')');
+          break;
+        case ',':
+          if (inGroup) {
+            tokens.push('|');
+            break;
+          }
+          tokens.push('\\' + c);
+          break;
+        default:
+          tokens.push(c);
+      }
+    }
+    tokens.push('$');
+    return new RegExp(tokens.join(''));
+  }
+
+  static completeUserURL(urlString: string): string {
+    if (urlString.startsWith('localhost') || urlString.startsWith('127.0.0.1'))
+      urlString = 'http://' + urlString;
+    return urlString;
+  }
+
+  static trimMiddle(string: string, maxLength: number) {
+    if (string.length <= maxLength)
+      return string;
+
+    const leftHalf = maxLength >> 1;
+    const rightHalf = maxLength - leftHalf - 1;
+    return string.substr(0, leftHalf) + '\u2026' + string.substr(this.length - rightHalf, rightHalf);
+  }
+
+  static enclosingIntRect(rect: types.Rect): types.Rect {
+    const x = Math.floor(rect.x + 1e-3);
+    const y = Math.floor(rect.y + 1e-3);
+    const x2 = Math.ceil(rect.x + rect.width - 1e-3);
+    const y2 = Math.ceil(rect.y + rect.height - 1e-3);
+    return { x, y, width: x2 - x, height: y2 - y };
+  }
+
+  static enclosingIntSize(size: types.Size): types.Size {
+    return { width: Math.floor(size.width + 1e-3), height: Math.floor(size.height + 1e-3) };
+  }
+
+  static urlMatches(urlString: string, match: types.URLMatch | undefined): boolean {
+    if (match === undefined || match === '')
+      return true;
+    if (helper.isString(match))
+      match = helper.globToRegex(match);
+    if (helper.isRegExp(match))
+      return match.test(urlString);
+    if (typeof match === 'string' && match === urlString)
+      return true;
+    const url = new URL(urlString);
+    if (typeof match === 'string')
+      return url.pathname === match;
+
+    assert(typeof match === 'function', 'url parameter should be string, RegExp or function');
+    return match(url);
+  }
+
+  // See https://joel.tools/microtasks/
+  static makeWaitForNextTask() {
+    if (parseInt(process.versions.node, 10) >= 11)
+      return setImmediate;
+
+    // Unlike Node 11, Node 10 and less have a bug with Task and MicroTask execution order:
+    // - https://github.com/nodejs/node/issues/22257
+    //
+    // So we can't simply run setImmediate to dispatch code in a following task.
+    // However, we can run setImmediate from-inside setImmediate to make sure we're getting
+    // in the following task.
+
+    let spinning = false;
+    const callbacks: (() => void)[] = [];
+    const loop = () => {
+      const callback = callbacks.shift();
+      if (!callback) {
+        spinning = false;
+        return;
+      }
+      setImmediate(loop);
+      // Make sure to call callback() as the last thing since it's
+      // untrusted code that might throw.
+      callback();
+    };
+
+    return (callback: () => void) => {
+      callbacks.push(callback);
+      if (!spinning) {
+        spinning = true;
+        setImmediate(loop);
+      }
+    };
+  }
+
+  static guid(): string {
+    return crypto.randomBytes(16).toString('hex');
+  }
+
+  static monotonicTime(): number {
+    const [seconds, nanoseconds] = process.hrtime();
+    return seconds * 1000 + (nanoseconds / 1000000 | 0);
+  }
+
+  static isPastDeadline(deadline: number) {
+    return deadline !== Number.MAX_SAFE_INTEGER && this.monotonicTime() >= deadline;
+  }
+
+  static timeUntilDeadline(deadline: number): number {
+    return Math.min(deadline - this.monotonicTime(), 2147483647); // 2^31-1 safe setTimeout in Node.
+  }
+
+  static optionsWithUpdatedTimeout<T extends types.TimeoutOptions>(options: T | undefined, deadline: number): T {
+    return { ...(options || {}) as T, timeout: this.timeUntilDeadline(deadline) };
+  }
 }
 
-export function assert(value: any, message?: string) {
+export function assert(value: any, message?: string): asserts value {
   if (!value)
     throw new Error(message);
 }
+
+export function assertMaxArguments(count: number, max: number): asserts count {
+  assert(count <= max, 'Too many arguments. If you need to pass more than 1 argument to the function wrap them in an object.');
+}
+
+export function getFromENV(name: string) {
+  let value = process.env[name];
+  value = value || process.env[`npm_config_${name.toLowerCase()}`];
+  value = value || process.env[`npm_package_config_${name.toLowerCase()}`];
+  return value;
+}
+
+export function logPolitely(toBeLogged: string) {
+  const logLevel = process.env.npm_config_loglevel;
+  const logLevelDisplay = ['silent', 'error', 'warn'].indexOf(logLevel || '') > -1;
+
+  if (!logLevelDisplay)
+    console.log(toBeLogged);  // eslint-disable-line no-console
+}
+
+const escapeGlobChars = new Set(['/', '$', '^', '+', '.', '(', ')', '=', '!', '|']);
 
 export const helper = Helper;

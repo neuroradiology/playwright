@@ -3,7 +3,7 @@ set -e
 set +x
 
 if [[ ("$1" == "-h") || ("$1" == "--help") ]]; then
-  echo "usage: $(basename $0) [output-absolute-path] [--wpe]"
+  echo "usage: $(basename $0) [output-absolute-path] [--wpe|--gtk]"
   echo
   echo "Generate distributable .zip archive from ./checkout folder that was previously built."
   echo
@@ -11,7 +11,7 @@ if [[ ("$1" == "-h") || ("$1" == "--help") ]]; then
 fi
 
 ZIP_PATH=$1
-USE_WPE=$2
+LINUX_FLAVOR=$2
 if [[ $ZIP_PATH != /* ]]; then
   echo "ERROR: path $ZIP_PATH is not absolute"
   exit 1
@@ -55,33 +55,37 @@ createZipForLinux() {
   # copy protocol
   node ../concat_protocol.js > $tmpdir/protocol.json
 
-  if [[ -n $USE_WPE ]]; then
+  if [[ "$LINUX_FLAVOR" == "--wpe" ]]; then
     # copy all relevant binaries
-    cp -t $tmpdir ./WebKitBuild/Release/bin/MiniBrowser ./WebKitBuild/Release/bin/WPE*Process
+    cp -t $tmpdir ./WebKitBuild/WPE/Release/bin/MiniBrowser ./WebKitBuild/WPE/Release/bin/WPE*Process
     # copy all relevant shared objects
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/DependenciesWPE/Root/lib" ldd WebKitBuild/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/[^ ]*' | xargs cp -t $tmpdir
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/DependenciesWPE/Root/lib" ldd WebKitBuild/Release/bin/WPENetworkProcess | grep -o '[^ ]*WebKitBuild/[^ ]*' | xargs cp -t $tmpdir
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/DependenciesWPE/Root/lib" ldd WebKitBuild/Release/bin/WPEWebProcess | grep -o '[^ ]*WebKitBuild/[^ ]*' | xargs cp -t $tmpdir
+    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
+    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/WPENetworkProcess | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
+    LD_LIBRARY_PATH="$PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib" ldd WebKitBuild/WPE/Release/bin/WPEWebProcess | grep -o '[^ ]*WebKitBuild/WPE/[^ ]*' | xargs cp -t $tmpdir
     mkdir -p $tmpdir/gio/modules
-    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/DependenciesWPE/Root/lib/gio/modules/*
+    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/WPE/DependenciesWPE/Root/lib/gio/modules/*
 
     cd $tmpdir
     ln -s libWPEBackend-fdo-1.0.so.1 libWPEBackend-fdo-1.0.so
     cd -
-  else
+  elif [[ "$LINUX_FLAVOR" == "--gtk" ]]; then
     # copy all relevant binaries
-    cp -t $tmpdir ./WebKitBuild/Release/bin/MiniBrowser ./WebKitBuild/Release/bin/WebKit*Process
+    cp -t $tmpdir ./WebKitBuild/GTK/Release/bin/MiniBrowser ./WebKitBuild/GTK/Release/bin/WebKit*Process
     # copy all relevant shared objects
-    LD_LIBRARY_PATH="$PWD/WebKitBuild/DependenciesGTK/Root/lib" ldd WebKitBuild/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/[^ ]*' | xargs cp -t $tmpdir
+    LD_LIBRARY_PATH="$PWD/WebKitBuild/GTK/DependenciesGTK/Root/lib" ldd WebKitBuild/GTK/Release/bin/MiniBrowser | grep -o '[^ ]*WebKitBuild/GTK/[^ ]*' | xargs cp -t $tmpdir
     mkdir -p $tmpdir/gio/modules
-    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/DependenciesGTK/Root/lib/gio/modules/*
+    cp -t $tmpdir/gio/modules $PWD/WebKitBuild/GTK/DependenciesGTK/Root/lib/gio/modules/*
 
     # we failed to nicely build libgdk_pixbuf - expect it in the env
     rm $tmpdir/libgdk_pixbuf*
+  else
+    echo "ERROR: must specify --gtk or --wpe"
+    exit 1
   fi
 
   # tar resulting directory and cleanup TMP.
   cd $tmpdir
+  strip --strip-unneeded * || true
   zip --symlinks -r $ZIP_PATH ./
   cd -
   rm -rf $tmpdir
@@ -95,11 +99,11 @@ createZipForWindows() {
   cp -t $tmpdir ./WebKitLibraries/win/bin64/*.dll
   cd WebKitBuild/Release/bin64
   cp -r -t $tmpdir WebKit.resources
-  cp -t $tmpdir JavaScriptCore.dll MiniBrowserLib.dll WTF.dll WebKit2.dll libEGL.dll libGLESv2.dll
-  cp -t $tmpdir MiniBrowser.exe WebKitNetworkProcess.exe WebKitWebProcess.exe
+  cp -t $tmpdir JavaScriptCore.dll PlaywrightLib.dll WTF.dll WebKit2.dll libEGL.dll libGLESv2.dll
+  cp -t $tmpdir Playwright.exe WebKitNetworkProcess.exe WebKitWebProcess.exe
   cd -
   cd /c/WEBKIT_WIN64_LIBS
-  cp -t $tmpdir msvcp140.dll vcruntime140.dll vcruntime140_1.dll
+  cp -t $tmpdir msvcp140.dll vcruntime140.dll vcruntime140_1.dll msvcp140_2.dll
   cd -
 
   # copy protocol

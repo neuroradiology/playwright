@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-export * from './lib/api';
-export const chromium: import('./lib/api').ChromiumPlaywright;
-export const firefox: import('./lib/api').FirefoxPlaywright;
-export const webkit: import('./lib/api').WebKitPlaywright;
-export type PlaywrightWeb = typeof import('./lib/web');
+import * as types from './types/types';
+
+export * from './types/types';
+export const webkit: types.BrowserType<types.WebKitBrowser>;
+export const chromium: types.BrowserType<types.ChromiumBrowser>;
+export const firefox: types.BrowserType<types.FirefoxBrowser>;

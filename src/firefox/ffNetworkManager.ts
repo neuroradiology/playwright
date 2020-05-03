@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-import { debugError, helper, RegisteredListener } from '../helper';
+import { helper, RegisteredListener } from '../helper';
 import { FFSession } from './ffConnection';
 import { Page } from '../page';
 import * as network from '../network';
 import * as frames from '../frames';
-import * as platform from '../platform';
 import { Protocol } from './protocol';
+import { logError } from '../logger';
 
 export class FFNetworkManager {
   private _session: FFSession;
@@ -52,17 +52,13 @@ export class FFNetworkManager {
   }
 
   _onRequestWillBeSent(event: Protocol.Network.requestWillBeSentPayload) {
-    const redirected = event.redirectedFrom ? this._requests.get(event.redirectedFrom) : null;
-    const frame = redirected ? redirected.request.frame() : (event.frameId ? this._page._frameManager.frame(event.frameId) : null);
+    const redirectedFrom = event.redirectedFrom ? (this._requests.get(event.redirectedFrom) || null) : null;
+    const frame = redirectedFrom ? redirectedFrom.request.frame() : (event.frameId ? this._page._frameManager.frame(event.frameId) : null);
     if (!frame)
       return;
-    let redirectChain: network.Request[] = [];
-    if (redirected) {
-      redirectChain = redirected.request._redirectChain;
-      redirectChain.push(redirected.request);
-      this._requests.delete(redirected._id);
-    }
-    const request = new InterceptableRequest(this._session, frame, redirectChain, event);
+    if (redirectedFrom)
+      this._requests.delete(redirectedFrom._id);
+    const request = new InterceptableRequest(this._session, frame, redirectedFrom, event);
     this._requests.set(request._id, request);
     this._page._frameManager.requestStarted(request.request);
   }
@@ -71,19 +67,18 @@ export class FFNetworkManager {
     const request = this._requests.get(event.requestId);
     if (!request)
       return;
-    const remoteAddress: network.RemoteAddress = { ip: event.remoteIPAddress || '', port: event.remotePort || 0 };
     const getResponseBody = async () => {
       const response = await this._session.send('Network.getResponseBody', {
         requestId: request._id
       });
       if (response.evicted)
         throw new Error(`Response body for ${request.request.method()} ${request.request.url()} was evicted!`);
-      return platform.Buffer.from(response.base64body, 'base64');
+      return Buffer.from(response.base64body, 'base64');
     };
     const headers: network.Headers = {};
     for (const {name, value} of event.headers)
       headers[name.toLowerCase()] = value;
-    const response = new network.Response(request.request, event.status, event.statusText, headers, remoteAddress, getResponseBody);
+    const response = new network.Response(request.request, event.status, event.statusText, headers, getResponseBody);
     this._page._frameManager.requestReceivedResponse(response);
   }
 
@@ -91,8 +86,8 @@ export class FFNetworkManager {
     const request = this._requests.get(event.requestId);
     if (!request)
       return;
-    const response = request.request.response()!;
-    // Keep redirected requests in the map for future reference in redirectChain.
+    const response = request.request._existingResponse()!;
+    // Keep redirected requests in the map for future reference as redirectedFrom.
     const isRedirected = response.status() >= 300 && response.status() <= 399;
     if (isRedirected) {
       response._requestFinished(new Error('Response body is unavailable for redirect responses'));
@@ -108,7 +103,7 @@ export class FFNetworkManager {
     if (!request)
       return;
     this._requests.delete(request._id);
-    const response = request.request.response();
+    const response = request.request._existingResponse();
     if (response)
       response._requestFinished();
     request.request._setFailureText(event.errorCode);
@@ -142,12 +137,12 @@ const causeToResourceType: {[key: string]: string} = {
   TYPE_WEB_MANIFEST: 'manifest',
 };
 
-class InterceptableRequest implements network.RequestDelegate {
+class InterceptableRequest implements network.RouteDelegate {
   readonly request: network.Request;
   _id: string;
   private _session: FFSession;
 
-  constructor(session: FFSession, frame: frames.Frame, redirectChain: network.Request[], payload: Protocol.Network.requestWillBeSentPayload) {
+  constructor(session: FFSession, frame: frames.Frame, redirectedFrom: InterceptableRequest | null, payload: Protocol.Network.requestWillBeSentPayload) {
     this._id = payload.requestId;
     this._session = session;
 
@@ -155,31 +150,59 @@ class InterceptableRequest implements network.RequestDelegate {
     for (const {name, value} of payload.headers)
       headers[name.toLowerCase()] = value;
 
-    this.request = new network.Request(payload.suspended ? this : null, frame, redirectChain, payload.navigationId,
-        payload.url, causeToResourceType[payload.cause] || 'other', payload.method, payload.postData, headers);
+    this.request = new network.Request(payload.isIntercepted ? this : null, frame, redirectedFrom ? redirectedFrom.request : null, payload.navigationId,
+        payload.url, causeToResourceType[payload.cause] || 'other', payload.method, payload.postData || null, headers);
   }
 
-  async continue(overrides: { headers?: { [key: string]: string } } = {}) {
+  async continue(overrides: { method?: string; headers?: network.Headers; postData?: string }) {
     const {
+      method,
       headers,
+      postData
     } = overrides;
-    await this._session.send('Network.resumeSuspendedRequest', {
+    await this._session.send('Network.resumeInterceptedRequest', {
       requestId: this._id,
-      headers: headers ? Object.entries(headers).filter(([, value]) => !Object.is(value, undefined)).map(([name, value]) => ({name, value})) : undefined,
-    }).catch(error => {
-      debugError(error);
-    });
+      method,
+      headers: headers ? headersArray(headers) : undefined,
+      postData: postData ? Buffer.from(postData).toString('base64') : undefined
+    }).catch(logError(this.request._page));
   }
 
-  async fulfill(response: { status: number; headers: network.Headers; contentType: string; body: (string | platform.BufferType); }) {
-    throw new Error('Fulfill is not supported in Firefox');
+  async fulfill(response: network.FulfillResponse) {
+    const responseBody = response.body && helper.isString(response.body) ? Buffer.from(response.body) : (response.body || null);
+
+    const responseHeaders: { [s: string]: string; } = {};
+    if (response.headers) {
+      for (const header of Object.keys(response.headers))
+        responseHeaders[header.toLowerCase()] = response.headers[header];
+    }
+    if (response.contentType)
+      responseHeaders['content-type'] = response.contentType;
+    if (responseBody && !('content-length' in responseHeaders))
+      responseHeaders['content-length'] = String(Buffer.byteLength(responseBody));
+
+    await this._session.send('Network.fulfillInterceptedRequest', {
+      requestId: this._id,
+      status: response.status || 200,
+      statusText: network.STATUS_TEXTS[String(response.status || 200)] || '',
+      headers: headersArray(responseHeaders),
+      base64body: responseBody ? responseBody.toString('base64') : undefined,
+    }).catch(logError(this.request._page));
   }
 
-  async abort() {
-    await this._session.send('Network.abortSuspendedRequest', {
+  async abort(errorCode: string) {
+    await this._session.send('Network.abortInterceptedRequest', {
       requestId: this._id,
-    }).catch(error => {
-      debugError(error);
-    });
+      errorCode,
+    }).catch(logError(this.request._page));
   }
+}
+
+export function headersArray(headers: network.Headers): Protocol.Network.HTTPHeader[] {
+  const result: Protocol.Network.HTTPHeader[] = [];
+  for (const name in headers) {
+    if (!Object.is(headers[name], undefined))
+      result.push({name, value: headers[name] + ''});
+  }
+  return result;
 }

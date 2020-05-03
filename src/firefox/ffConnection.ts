@@ -15,22 +15,26 @@
  * limitations under the License.
  */
 
-import {assert} from '../helper';
-import * as platform from '../platform';
-import { ConnectionTransport } from '../transport';
+import { EventEmitter } from 'events';
+import { assert } from '../helper';
+import { ConnectionTransport, ProtocolRequest, ProtocolResponse, protocolLog } from '../transport';
 import { Protocol } from './protocol';
-
-const debugProtocol = platform.debug('pw:protocol');
+import { InnerLogger } from '../logger';
 
 export const ConnectionEvents = {
   Disconnected: Symbol('Disconnected'),
 };
 
-export class FFConnection extends platform.EventEmitter {
+// FFPlaywright uses this special id to issue Browser.close command which we
+// should ignore.
+export const kBrowserCloseMessageId = -9999;
+
+export class FFConnection extends EventEmitter {
   private _lastId: number;
   private _callbacks: Map<number, {resolve: Function, reject: Function, error: Error, method: string}>;
   private _transport: ConnectionTransport;
-  private _sessions: Map<string, FFSession>;
+  private _logger: InnerLogger;
+  readonly _sessions: Map<string, FFSession>;
   _closed: boolean;
 
   on: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
@@ -39,9 +43,10 @@ export class FFConnection extends platform.EventEmitter {
   removeListener: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   once: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
 
-  constructor(transport: ConnectionTransport) {
+  constructor(transport: ConnectionTransport, logger: InnerLogger) {
     super();
     this._transport = transport;
+    this._logger = logger;
     this._lastId = 0;
     this._callbacks = new Map();
 
@@ -57,15 +62,7 @@ export class FFConnection extends platform.EventEmitter {
     this.once = super.once;
   }
 
-  static fromSession(session: FFSession): FFConnection {
-    return session._connection;
-  }
-
-  session(sessionId: string): FFSession | null {
-    return this._sessions.get(sessionId) || null;
-  }
-
-  send<T extends keyof Protocol.CommandParameters>(
+  async send<T extends keyof Protocol.CommandParameters>(
     method: T,
     params?: Protocol.CommandParameters[T]
   ): Promise<Protocol.CommandReturnValues[T]> {
@@ -80,42 +77,33 @@ export class FFConnection extends platform.EventEmitter {
     return ++this._lastId;
   }
 
-  _rawSend(message: any) {
-    message = JSON.stringify(message);
-    debugProtocol('SEND ► ' + message);
+  _rawSend(message: ProtocolRequest) {
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, 'SEND ► ' + rewriteInjectedScriptEvaluationLog(message));
     this._transport.send(message);
   }
 
-  async _onMessage(message: string) {
-    debugProtocol('◀ RECV ' + message);
-    const object = JSON.parse(message);
-    if (object.method === 'Target.attachedToTarget') {
-      const sessionId = object.params.sessionId;
-      const session = new FFSession(this, object.params.targetInfo.type, sessionId, message => this._rawSend({...message, sessionId}));
-      this._sessions.set(sessionId, session);
-    } else if (object.method === 'Browser.detachedFromTarget') {
-      const session = this._sessions.get(object.params.sessionId);
-      if (session) {
-        session._onClosed();
-        this._sessions.delete(object.params.sessionId);
-      }
-    }
-    if (object.sessionId) {
-      const session = this._sessions.get(object.sessionId);
+  async _onMessage(message: ProtocolResponse) {
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, '◀ RECV ' + JSON.stringify(message));
+    if (message.id === kBrowserCloseMessageId)
+      return;
+    if (message.sessionId) {
+      const session = this._sessions.get(message.sessionId);
       if (session)
-        session.dispatchMessage(object);
-    } else if (object.id) {
-      const callback = this._callbacks.get(object.id);
+        session.dispatchMessage(message);
+    } else if (message.id) {
+      const callback = this._callbacks.get(message.id);
       // Callbacks could be all rejected if someone has called `.dispose()`.
       if (callback) {
-        this._callbacks.delete(object.id);
-        if (object.error)
-          callback.reject(createProtocolError(callback.error, callback.method, object));
+        this._callbacks.delete(message.id);
+        if (message.error)
+          callback.reject(createProtocolError(callback.error, callback.method, message.error));
         else
-          callback.resolve(object.result);
+          callback.resolve(message.result);
       }
     } else {
-      Promise.resolve().then(() => this.emit(object.method, object.params));
+      Promise.resolve().then(() => this.emit(message.method!, message.params));
     }
   }
 
@@ -127,7 +115,7 @@ export class FFConnection extends platform.EventEmitter {
       callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
     this._callbacks.clear();
     for (const session of this._sessions.values())
-      session._onClosed();
+      session.dispose();
     this._sessions.clear();
     Promise.resolve().then(() => this.emit(ConnectionEvents.Disconnected));
   }
@@ -137,9 +125,10 @@ export class FFConnection extends platform.EventEmitter {
       this._transport.close();
   }
 
-  async createSession(targetId: string): Promise<FFSession> {
-    const {sessionId} = await this.send('Target.attachToTarget', {targetId});
-    return this._sessions.get(sessionId)!;
+  createSession(sessionId: string, type: string): FFSession {
+    const session = new FFSession(this, type, sessionId, message => this._rawSend({...message, sessionId}));
+    this._sessions.set(sessionId, session);
+    return session;
   }
 }
 
@@ -147,13 +136,14 @@ export const FFSessionEvents = {
   Disconnected: Symbol('Disconnected')
 };
 
-export class FFSession extends platform.EventEmitter {
+export class FFSession extends EventEmitter {
   _connection: FFConnection;
   _disposed = false;
   private _callbacks: Map<number, {resolve: Function, reject: Function, error: Error, method: string}>;
   private _targetType: string;
   private _sessionId: string;
   private _rawSend: (message: any) => void;
+  private _crashed: boolean = false;
   on: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   addListener: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   off: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
@@ -175,12 +165,18 @@ export class FFSession extends platform.EventEmitter {
     this.once = super.once;
   }
 
-  send<T extends keyof Protocol.CommandParameters>(
+  markAsCrashed() {
+    this._crashed = true;
+  }
+
+  async send<T extends keyof Protocol.CommandParameters>(
     method: T,
     params?: Protocol.CommandParameters[T]
   ): Promise<Protocol.CommandReturnValues[T]> {
+    if (this._crashed)
+      throw new Error('Page crashed');
     if (this._disposed)
-      return Promise.reject(new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`));
+      throw new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`);
     const id = this._connection.nextMessageId();
     this._rawSend({method, params, id});
     return new Promise((resolve, reject) => {
@@ -188,37 +184,46 @@ export class FFSession extends platform.EventEmitter {
     });
   }
 
-  dispatchMessage(object: { id?: number; method: string; params: object; error: { message: string; data: any; }; result?: any; }) {
+  dispatchMessage(object: ProtocolResponse) {
     if (object.id && this._callbacks.has(object.id)) {
       const callback = this._callbacks.get(object.id)!;
       this._callbacks.delete(object.id);
       if (object.error)
-        callback.reject(createProtocolError(callback.error, callback.method, object));
+        callback.reject(createProtocolError(callback.error, callback.method, object.error));
       else
         callback.resolve(object.result);
     } else {
       assert(!object.id);
-      Promise.resolve().then(() => this.emit(object.method, object.params));
+      Promise.resolve().then(() => this.emit(object.method!, object.params));
     }
   }
 
-  _onClosed() {
+  dispose() {
     for (const callback of this._callbacks.values())
       callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
     this._callbacks.clear();
     this._disposed = true;
+    this._connection._sessions.delete(this._sessionId);
     Promise.resolve().then(() => this.emit(FFSessionEvents.Disconnected));
   }
 }
 
-function createProtocolError(error: Error, method: string, object: { error: { message: string; data: any; }; }): Error {
-  let message = `Protocol error (${method}): ${object.error.message}`;
-  if ('data' in object.error)
-    message += ` ${object.error.data}`;
+function createProtocolError(error: Error, method: string, protocolError: { message: string; data: any; }): Error {
+  let message = `Protocol error (${method}): ${protocolError.message}`;
+  if ('data' in protocolError)
+    message += ` ${protocolError.data}`;
   return rewriteError(error, message);
 }
 
 function rewriteError(error: Error, message: string): Error {
   error.message = message;
   return error;
+}
+
+function rewriteInjectedScriptEvaluationLog(message: ProtocolRequest): string {
+  // Injected script is very long and clutters protocol logs.
+  // To increase development velocity, we skip replace it with short description in the log.
+  if (message.method === 'Runtime.evaluate' && message.params && message.params.expression && message.params.expression.includes('src/injected/injected.ts'))
+    return `{"id":${message.id} [evaluate injected script]}`;
+  return JSON.stringify(message);
 }

@@ -14,119 +14,223 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-const path = require('path');
-const {TestServer} = require('../utils/testserver/');
-const {TestRunner, Reporter} = require('../utils/testrunner/');
-const utils = require('./utils');
 
-let parallel = 1;
-if (process.env.PPTR_PARALLEL_TESTS)
-  parallel = parseInt(process.env.PPTR_PARALLEL_TESTS.trim(), 10);
-const parallelArgIndex = process.argv.indexOf('-j');
-if (parallelArgIndex !== -1)
-  parallel = parseInt(process.argv[parallelArgIndex + 1], 10);
-require('events').defaultMaxListeners *= parallel;
+const fs = require('fs');
+const readline = require('readline');
+const TestRunner = require('../utils/testrunner/');
+const {Environment} = require('../utils/testrunner/Test');
 
-let timeout = process.env.CI ? 30 * 1000 : 10 * 1000;
-if (!isNaN(process.env.TIMEOUT))
-  timeout = parseInt(process.env.TIMEOUT, 10);
-const testRunner = new TestRunner({
-  timeout,
-  parallel,
-  breakOnFailure: process.argv.indexOf('--break-on-failure') !== -1,
-});
-const {describe, fdescribe, beforeAll, afterAll, beforeEach, afterEach} = testRunner;
-
-console.log('Testing on Node', process.version);
-
-beforeAll(async state => {
-  const assetsPath = path.join(__dirname, 'assets');
-  const cachedPath = path.join(__dirname, 'assets', 'cached');
-
-  const port = 8907 + state.parallelIndex * 3;
-  state.server = await TestServer.create(assetsPath, port);
-  state.server.enableHTTPCache(cachedPath);
-  state.server.PORT = port;
-  state.server.PREFIX = `http://localhost:${port}`;
-  state.server.CROSS_PROCESS_PREFIX = `http://127.0.0.1:${port}`;
-  state.server.EMPTY_PAGE = `http://localhost:${port}/empty.html`;
-
-  const httpsPort = port + 1;
-  state.httpsServer = await TestServer.createHTTPS(assetsPath, httpsPort);
-  state.httpsServer.enableHTTPCache(cachedPath);
-  state.httpsServer.PORT = httpsPort;
-  state.httpsServer.PREFIX = `https://localhost:${httpsPort}`;
-  state.httpsServer.CROSS_PROCESS_PREFIX = `https://127.0.0.1:${httpsPort}`;
-  state.httpsServer.EMPTY_PAGE = `https://localhost:${httpsPort}/empty.html`;
-
-  const sourcePort = port + 2;
-  state.sourceServer = await TestServer.create(path.join(__dirname, '..'), sourcePort);
-  state.sourceServer.PORT = sourcePort;
-  state.sourceServer.PREFIX = `http://localhost:${sourcePort}`;
-});
-
-afterAll(async({server, httpsServer}) => {
-  await Promise.all([
-    server.stop(),
-    httpsServer.stop(),
-  ]);
-});
-
-beforeEach(async({server, httpsServer}) => {
-  server.reset();
-  httpsServer.reset();
-});
-
-const products = ['WebKit', 'Firefox', 'Chromium'];
-let product;
-let events;
-if (process.env.BROWSER === 'firefox') {
-  product = 'Firefox';
-  events = {
-    ...require('../lib/events').Events,
-    ...require('../lib/chromium/events').Events,
-  };
-} else if (process.env.BROWSER === 'webkit') {
-  product = 'WebKit';
-  events = require('../lib/events').Events;
-} else {
-  product = 'Chromium';
-  events = require('../lib/events').Events;
-}
-
-describe(product, () => {
-  testRunner.loadTests(require('./playwright.spec.js'), {
-    product,
-    playwrightPath: utils.projectRoot(),
-    testRunner,
-  });
-  if (process.env.COVERAGE) {
-    const api = require('../lib/api');
-    const filteredApi = {};
-    Object.keys(api).forEach(name => {
-      if (products.some(p => name.startsWith(p)) && !name.startsWith(product))
-        return;
-      filteredApi[name] = api[name];
-    });
-    utils.recordAPICoverage(testRunner, filteredApi, events);
+function getCLIArgument(argName) {
+  for (let i = 0; i < process.argv.length; ++i) {
+    // Support `./test.js --foo bar
+    if (process.argv[i] === argName)
+      return process.argv[i + 1];
+    // Support `./test.js --foo=bar
+    if (argName.startsWith('--') && process.argv[i].startsWith(argName + '='))
+      return process.argv[i].substring((argName + '=').length);
+    // Support `./test.js -j4
+    if (!argName.startsWith('--') && argName.startsWith('-') && process.argv[i].startsWith(argName))
+      return process.argv[i].substring(argName.length);
   }
-});
-
-if (process.env.CI && testRunner.hasFocusedTestsOrSuites()) {
-  console.error('ERROR: "focused" tests/suites are prohibitted on bots. Remove any "fit"/"fdescribe" declarations.');
-  process.exit(1);
+  return null;
 }
 
-new Reporter(testRunner, {
-  verbose: process.argv.includes('--verbose'),
-  summary: !process.argv.includes('--verbose'),
-  projectFolder: utils.projectRoot(),
-  showSlowTests: process.env.CI ? 5 : 0,
-  showSkippedTests: 10,
-});
+function collect(browserNames) {
+  let parallel = 1;
+  if (process.env.PW_PARALLEL_TESTS)
+    parallel = parseInt(process.env.PW_PARALLEL_TESTS.trim(), 10);
+  if (getCLIArgument('-j'))
+    parallel = parseInt(getCLIArgument('-j'), 10);
+  require('events').defaultMaxListeners *= parallel;
 
-// await utils.initializeFlakinessDashboardIfNeeded(testRunner);
-testRunner.run().then(result => {
-  process.exit(result.exitCode);
-});
+  let timeout = process.env.CI ? 30 * 1000 : 10 * 1000;
+  if (!isNaN(process.env.TIMEOUT))
+    timeout = parseInt(process.env.TIMEOUT * 1000, 10);
+  const MAJOR_NODEJS_VERSION = parseInt(process.version.substring(1).split('.')[0], 10);
+  if (MAJOR_NODEJS_VERSION >= 8 && require('inspector').url()) {
+    console.log('Detected inspector - disabling timeout to be debugger-friendly');
+    timeout = 0;
+  }
 
+  const config = require('./test.config');
+
+  const testRunner = new TestRunner({
+    timeout,
+    totalTimeout: process.env.CI ? 30 * 60 * 1000 : 0, // 30 minutes on CI
+    parallel,
+    breakOnFailure: process.argv.indexOf('--break-on-failure') !== -1,
+    verbose: process.argv.includes('--verbose'),
+    summary: !process.argv.includes('--verbose'),
+    showSlowTests: process.env.CI ? 5 : 0,
+    showMarkedAsFailingTests: 10,
+  });
+  if (config.setupTestRunner)
+    config.setupTestRunner(testRunner);
+
+  for (const [key, value] of Object.entries(testRunner.api()))
+    global[key] = value;
+
+  // TODO: this should be a preinstalled playwright by default.
+  const playwrightPath = config.playwrightPath;
+  const playwright = require(playwrightPath);
+
+  const playwrightEnvironment = new Environment('Playwright');
+  playwrightEnvironment.beforeAll(async state => {
+    state.playwright = playwright;
+    global.playwright = playwright;
+  });
+  playwrightEnvironment.afterAll(async state => {
+    delete state.playwright;
+    delete global.playwright;
+  });
+
+  testRunner.collector().useEnvironment(playwrightEnvironment);
+  for (const e of config.globalEnvironments || [])
+    testRunner.collector().useEnvironment(e);
+
+  for (const browserName of browserNames) {
+    const browserType = playwright[browserName];
+    const browserTypeEnvironment = new Environment('BrowserType');
+    browserTypeEnvironment.beforeAll(async state => {
+      state.browserType = browserType;
+    });
+    browserTypeEnvironment.afterAll(async state => {
+      delete state.browserType;
+    });
+
+    // TODO: maybe launch options per browser?
+    const launchOptions = {
+      ...(config.launchOptions || {}),
+      handleSIGINT: false,
+    };
+    if (launchOptions.executablePath)
+      launchOptions.executablePath = launchOptions.executablePath[browserName];
+    if (launchOptions.executablePath) {
+      const YELLOW_COLOR = '\x1b[33m';
+      const RESET_COLOR = '\x1b[0m';
+      console.warn(`${YELLOW_COLOR}WARN: running ${browserName} tests with ${launchOptions.executablePath}${RESET_COLOR}`);
+      browserType._executablePath = launchOptions.executablePath;
+      delete launchOptions.executablePath;
+    } else {
+      if (!fs.existsSync(browserType.executablePath()))
+        throw new Error(`Browser is not downloaded. Run 'npm install' and try to re-run tests`);
+    }
+
+    const browserEnvironment = new Environment(browserName);
+    browserEnvironment.beforeAll(async state => {
+      state._logger = null;
+      state.browser = await state.browserType.launch({...launchOptions, logger: {
+        isEnabled: (name, severity) => {
+          return name === 'browser' ||
+              (name === 'protocol' && config.dumpProtocolOnFailure);
+        },
+        log: (name, severity, message, args) => {
+          if (state._logger)
+            state._logger(name, severity, message);
+        }
+      }});
+    });
+    browserEnvironment.afterAll(async state => {
+      await state.browser.close();
+      delete state.browser;
+      delete state._logger;
+    });
+    browserEnvironment.beforeEach(async(state, testRun) => {
+      state._logger = (name, severity, message) => {
+        if (name === 'browser') {
+          if (severity === 'warning')
+            testRun.log(`\x1b[31m[browser]\x1b[0m ${message}`)
+          else
+            testRun.log(`\x1b[33m[browser]\x1b[0m ${message}`)
+        } else if (name === 'protocol' && config.dumpProtocolOnFailure) {
+          testRun.log(`\x1b[32m[protocol]\x1b[0m ${message}`)
+        }
+      }
+    });
+    browserEnvironment.afterEach(async (state, testRun) => {
+      state._logger = null;
+      if (config.dumpProtocolOnFailure) {
+        if (testRun.ok())
+          testRun.output().splice(0);
+      }
+    });
+
+    const pageEnvironment = new Environment('Page');
+    pageEnvironment.beforeEach(async state => {
+      state.context = await state.browser.newContext();
+      state.page = await state.context.newPage();
+    });
+    pageEnvironment.afterEach(async state => {
+      await state.context.close();
+      state.context = null;
+      state.page = null;
+    });
+
+    const suiteName = { 'chromium': 'Chromium', 'firefox': 'Firefox', 'webkit': 'WebKit' }[browserName];
+    describe(suiteName, () => {
+      // In addition to state, expose these two on global so that describes can access them.
+      global.playwright = playwright;
+      global.browserType = browserType;
+
+      testRunner.collector().useEnvironment(browserTypeEnvironment);
+
+      for (const spec of config.specs || []) {
+        const skip = spec.browsers && !spec.browsers.includes(browserName);
+        (skip ? xdescribe : describe)(spec.title || '', () => {
+          for (const e of spec.environments || ['page']) {
+            if (e === 'browser') {
+              testRunner.collector().useEnvironment(browserEnvironment);
+            } else if (e === 'page') {
+              testRunner.collector().useEnvironment(browserEnvironment);
+              testRunner.collector().useEnvironment(pageEnvironment);
+            } else {
+              testRunner.collector().useEnvironment(e);
+            }
+          }
+          for (const file of spec.files || []) {
+            require(file);
+            delete require.cache[require.resolve(file)];
+          }
+        });
+      }
+
+      delete global.browserType;
+      delete global.playwright;
+    });
+  }
+  for (const [key, value] of Object.entries(testRunner.api())) {
+    // expect is used when running tests, while the rest of api is not.
+    if (key !== 'expect')
+      delete global[key];
+  }
+
+  return testRunner;
+}
+
+module.exports = collect;
+
+if (require.main === module) {
+  console.log('Testing on Node', process.version);
+  const browserNames = ['chromium', 'firefox', 'webkit'].filter(name => {
+    return process.env.BROWSER === name || process.env.BROWSER === 'all';
+  });
+  const testRunner = collect(browserNames);
+
+  const testNameFilter = getCLIArgument('--filter');
+  if (testNameFilter && !testRunner.focusMatchingNameTests(new RegExp(testNameFilter, 'i')).length) {
+    console.log('ERROR: no tests matched given `--filter` regex.');
+    process.exit(1);
+  }
+
+  const fileNameFilter = getCLIArgument('--file');
+  if (fileNameFilter && !testRunner.focusMatchingFileName(new RegExp(fileNameFilter, 'i')).length) {
+    console.log('ERROR: no files matched given `--file` regex.');
+    process.exit(1);
+  }
+
+  const repeat = parseInt(getCLIArgument('--repeat'), 10);
+  if (!isNaN(repeat))
+    testRunner.repeatAll(repeat);
+
+  testRunner.run().then(() => { delete global.expect; });
+}

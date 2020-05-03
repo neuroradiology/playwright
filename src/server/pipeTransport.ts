@@ -15,34 +15,42 @@
  * limitations under the License.
  */
 
-import { debugError, helper, RegisteredListener } from '../helper';
-import { ConnectionTransport } from '../transport';
+import { helper, RegisteredListener } from '../helper';
+import { ConnectionTransport, ProtocolRequest, ProtocolResponse } from '../transport';
+import { logError, InnerLogger } from '../logger';
 
 export class PipeTransport implements ConnectionTransport {
   private _pipeWrite: NodeJS.WritableStream | null;
   private _pendingMessage = '';
   private _eventListeners: RegisteredListener[];
-  onmessage?: (message: string) => void;
+  private _waitForNextTask = helper.makeWaitForNextTask();
+
+  onmessage?: (message: ProtocolResponse) => void;
   onclose?: () => void;
 
-  constructor(pipeWrite: NodeJS.WritableStream, pipeRead: NodeJS.ReadableStream) {
+  constructor(pipeWrite: NodeJS.WritableStream, pipeRead: NodeJS.ReadableStream, logger: InnerLogger) {
     this._pipeWrite = pipeWrite;
     this._eventListeners = [
       helper.addEventListener(pipeRead, 'data', buffer => this._dispatch(buffer)),
       helper.addEventListener(pipeRead, 'close', () => {
+        helper.removeEventListeners(this._eventListeners);
         if (this.onclose)
           this.onclose.call(null);
       }),
-      helper.addEventListener(pipeRead, 'error', debugError),
-      helper.addEventListener(pipeWrite, 'error', debugError),
+      helper.addEventListener(pipeRead, 'error', logError(logger)),
+      helper.addEventListener(pipeWrite, 'error', logError(logger)),
     ];
     this.onmessage = undefined;
     this.onclose = undefined;
   }
 
-  send(message: string) {
-    this._pipeWrite!.write(message);
+  send(message: ProtocolRequest) {
+    this._pipeWrite!.write(JSON.stringify(message));
     this._pipeWrite!.write('\0');
+  }
+
+  close() {
+    throw new Error('unimplemented');
   }
 
   _dispatch(buffer: Buffer) {
@@ -52,24 +60,22 @@ export class PipeTransport implements ConnectionTransport {
       return;
     }
     const message = this._pendingMessage + buffer.toString(undefined, 0, end);
-    if (this.onmessage)
-      this.onmessage.call(null, message);
+    this._waitForNextTask(() => {
+      if (this.onmessage)
+        this.onmessage.call(null, JSON.parse(message));
+    });
 
     let start = end + 1;
     end = buffer.indexOf('\0', start);
     while (end !== -1) {
-      if (this.onmessage)
-        this.onmessage.call(null, buffer.toString(undefined, start, end));
+      const message = buffer.toString(undefined, start, end);
+      this._waitForNextTask(() => {
+        if (this.onmessage)
+          this.onmessage.call(null, JSON.parse(message));
+      });
       start = end + 1;
       end = buffer.indexOf('\0', start);
     }
     this._pendingMessage = buffer.toString(undefined, start);
-  }
-
-  close() {
-    this._pipeWrite = null;
-    helper.removeEventListeners(this._eventListeners);
-    if (this.onclose)
-      this.onclose.call(null);
   }
 }

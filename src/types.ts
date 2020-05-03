@@ -17,19 +17,18 @@
 import * as js from './javascript';
 import * as dom from './dom';
 
-type Boxed<Args extends any[]> = { [Index in keyof Args]: Args[Index] | js.JSHandle<Args[Index]> };
-type PageFunction<Args extends any[], R = any> = string | ((...args: Args) => R | Promise<R>);
-type PageFunctionOn<On, Args extends any[], R = any> = string | ((on: On, ...args: Args) => R | Promise<R>);
-
-type Handle<T> = T extends Node ? dom.ElementHandle<T> : js.JSHandle<T>;
-
-export type Evaluate = <Args extends any[], R>(pageFunction: PageFunction<Args, R>, ...args: Boxed<Args>) => Promise<R>;
-export type EvaluateHandle = <Args extends any[], R>(pageFunction: PageFunction<Args,  R>, ...args: Boxed<Args>) => Promise<Handle<R>>;
-export type $Eval = <Args extends any[], R>(selector: string, pageFunction: PageFunctionOn<Element, Args, R>, ...args: Boxed<Args>) => Promise<R>;
-export type $$Eval = <Args extends any[], R>(selector: string, pageFunction: PageFunctionOn<Element[], Args, R>, ...args: Boxed<Args>) => Promise<R>;
-export type $Wait = <Args extends any[], R>(selector: string, pageFunction: PageFunctionOn<Element | undefined, Args, R>, options?: WaitForFunctionOptions, ...args: Boxed<Args>) => Promise<Handle<R>>;
-export type EvaluateOn<T> = <Args extends any[], R>(pageFunction: PageFunctionOn<T, Args, R>, ...args: Boxed<Args>) => Promise<R>;
-export type EvaluateHandleOn<T> = <Args extends any[], R>(pageFunction: PageFunctionOn<T, Args, R>, ...args: Boxed<Args>) => Promise<Handle<R>>;
+type NoHandles<Arg> = Arg extends js.JSHandle ? never : (Arg extends object ? { [Key in keyof Arg]: NoHandles<Arg[Key]> } : Arg);
+type Unboxed<Arg> =
+  Arg extends dom.ElementHandle<infer T> ? T :
+  Arg extends js.JSHandle<infer T> ? T :
+  Arg extends NoHandles<Arg> ? Arg :
+  Arg extends Array<infer T> ? Array<Unboxed<T>> :
+  Arg extends object ? { [Key in keyof Arg]: Unboxed<Arg[Key]> } :
+  Arg;
+export type Func0<R> = string | (() => R | Promise<R>);
+export type Func1<Arg, R> = string | ((arg: Unboxed<Arg>) => R | Promise<R>);
+export type FuncOn<On, Arg2, R> = string | ((on: On, arg2: Unboxed<Arg2>) => R | Promise<R>);
+export type SmartHandle<T> = T extends Node ? dom.ElementHandle<T> : js.JSHandle<T>;
 
 export type Size = { width: number, height: number };
 export type Point = { x: number, y: number };
@@ -37,10 +36,36 @@ export type Rect = Size & Point;
 export type Quad = [ Point, Point, Point, Point ];
 
 export type TimeoutOptions = { timeout?: number };
-export type Visibility = 'visible' | 'hidden' | 'any';
 
-export type Polling = 'raf' | 'mutation' | number;
+export type WaitForElementOptions = TimeoutOptions & { waitFor?: 'attached' | 'detached' | 'visible' | 'hidden' };
+
+export type Polling = 'raf' | number;
 export type WaitForFunctionOptions = TimeoutOptions & { polling?: Polling };
+
+export type LifecycleEvent = 'load' | 'domcontentloaded' | 'networkidle';
+export const kLifecycleEvents: Set<LifecycleEvent> = new Set(['load', 'domcontentloaded', 'networkidle']);
+
+export type NavigateOptions = TimeoutOptions & {
+  waitUntil?: LifecycleEvent,
+};
+
+export type NavigatingActionWaitOptions = TimeoutOptions & {
+  noWaitAfter?: boolean,
+};
+
+export type PointerActionWaitOptions = TimeoutOptions & {
+  force?: boolean,
+};
+
+export type WaitForNavigationOptions = TimeoutOptions & {
+  waitUntil?: LifecycleEvent,
+  url?: URLMatch
+};
+
+export type ExtendedWaitForNavigationOptions = TimeoutOptions & {
+  waitUntil?: LifecycleEvent | 'commit',
+  url?: URLMatch
+};
 
 export type ElementScreenshotOptions = {
   type?: 'png' | 'jpeg',
@@ -52,13 +77,6 @@ export type ElementScreenshotOptions = {
 export type ScreenshotOptions = ElementScreenshotOptions & {
   fullPage?: boolean,
   clip?: Rect,
-};
-
-export type Viewport = {
-  width: number;
-  height: number;
-  deviceScaleFactor?: number;
-  isMobile?: boolean;
 };
 
 export type URLMatch = string | RegExp | ((url: URL) => boolean);
@@ -82,6 +100,12 @@ export type SelectOption = {
 
 export type FilePayload = {
   name: string,
+  mimeType: string,
+  buffer: Buffer,
+};
+
+export type FileTransferPayload = {
+  name: string,
   type: string,
   data: string,
 };
@@ -93,11 +117,13 @@ export type ColorScheme = 'dark' | 'light' | 'no-preference';
 export const colorSchemes: Set<ColorScheme> = new Set(['dark', 'light', 'no-preference']);
 
 export type DeviceDescriptor = {
-  name: string,
   userAgent: string,
-  viewport: Viewport,
+  viewport: Size,
+  deviceScaleFactor: number,
+  isMobile: boolean,
+  hasTouch: boolean
 };
-export type Devices = { [name: string]: DeviceDescriptor } & DeviceDescriptor[];
+export type Devices = { [name: string]: DeviceDescriptor };
 
 export type PDFOptions = {
   scale?: number,
@@ -118,7 +144,7 @@ export type PDFOptions = {
 export type CoverageEntry = {
   url: string,
   text: string,
-  ranges : {start: number, end: number}[]
+  ranges: {start: number, end: number}[]
 };
 
 export type CSSCoverageOptions = {
@@ -128,4 +154,12 @@ export type CSSCoverageOptions = {
 export type JSCoverageOptions = {
   resetOnNavigation?: boolean,
   reportAnonymousScripts?: boolean,
+};
+
+export type ParsedSelector = {
+  parts: {
+    name: string,
+    body: string,
+  }[],
+  capture?: number,
 };

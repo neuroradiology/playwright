@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-import {helper, debugError} from '../helper';
+import { helper } from '../helper';
 import * as js from '../javascript';
 import { FFSession } from './ffConnection';
 import { Protocol } from './protocol';
@@ -44,65 +44,45 @@ export class FFExecutionContext implements js.ExecutionContextDelegate {
     if (typeof pageFunction !== 'function')
       throw new Error(`Expected to get |string| or |function| as the first argument, but got "${pageFunction}" instead.`);
 
-    let functionText = pageFunction.toString();
-    try {
-      new Function('(' + functionText + ')');
-    } catch (e1) {
-      // This means we might have a function shorthand. Try another
-      // time prefixing 'function '.
-      if (functionText.startsWith('async '))
-        functionText = 'async function ' + functionText.substring('async '.length);
-      else
-        functionText = 'function ' + functionText;
-      try {
-        new Function('(' + functionText  + ')');
-      } catch (e2) {
-        // We tried hard to serialize, but there's a weird beast here.
-        throw new Error('Passed function is not well-serializable!');
-      }
-    }
-    const protocolArgs = args.map(arg => {
-      if (arg instanceof js.JSHandle) {
-        if (arg._context !== context)
-          throw new Error('JSHandles can be evaluated only in the context they were created!');
-        if (arg._disposed)
-          throw new Error('JSHandle is disposed!');
-        return this._toCallArgument(arg._remoteObject);
-      }
-      if (Object.is(arg, Infinity))
-        return {unserializableValue: 'Infinity'};
-      if (Object.is(arg, -Infinity))
-        return {unserializableValue: '-Infinity'};
-      if (Object.is(arg, -0))
-        return {unserializableValue: '-0'};
-      if (Object.is(arg, NaN))
-        return {unserializableValue: 'NaN'};
-      return {value: arg};
+    const { functionText, values, handles, dispose } = await js.prepareFunctionCall<Protocol.Runtime.CallFunctionArgument>(pageFunction, context, args, (value: any) => {
+      if (Object.is(value, -0))
+        return { handle: { unserializableValue: '-0' } };
+      if (Object.is(value, Infinity))
+        return { handle: { unserializableValue: 'Infinity' } };
+      if (Object.is(value, -Infinity))
+        return { handle: { unserializableValue: '-Infinity' } };
+      if (Object.is(value, NaN))
+        return { handle: { unserializableValue: 'NaN' } };
+      if (value && (value instanceof js.JSHandle))
+        return { handle: this._toCallArgument(value._remoteObject) };
+      return { value };
     });
-    let callFunctionPromise;
+
     try {
-      callFunctionPromise = this._session.send('Runtime.callFunction', {
+      const payload = await this._session.send('Runtime.callFunction', {
         functionDeclaration: functionText,
-        args: protocolArgs,
+        args: [
+          ...values.map(value => ({ value })),
+          ...handles,
+        ],
         returnByValue,
         executionContextId: this._executionContextId
-      });
-    } catch (err) {
-      if (err instanceof TypeError && err.message.startsWith('Converting circular structure to JSON'))
-        err.message += ' Are you passing a nested JSHandle?';
-      throw err;
+      }).catch(rewriteError);
+      checkException(payload.exceptionDetails);
+      if (returnByValue)
+        return deserializeValue(payload.result!);
+      return context._createHandle(payload.result);
+    } finally {
+      dispose();
     }
-    const payload = await callFunctionPromise.catch(rewriteError);
-    checkException(payload.exceptionDetails);
-    if (returnByValue)
-      return deserializeValue(payload.result!);
-    return context._createHandle(payload.result);
 
     function rewriteError(error: Error): (Protocol.Runtime.evaluateReturnValue | Protocol.Runtime.callFunctionReturnValue) {
       if (error.message.includes('cyclic object value') || error.message.includes('Object is not serializable'))
         return {result: {type: 'undefined', value: undefined}};
       if (error.message.includes('Failed to find execution context with id') || error.message.includes('Execution context was destroyed!'))
         throw new Error('Execution context was destroyed, most likely because of a navigation.');
+      if (error instanceof TypeError && error.message.startsWith('Converting circular structure to JSON'))
+        error.message += ' Are you passing a nested JSHandle?';
       throw error;
     }
   }
@@ -127,11 +107,7 @@ export class FFExecutionContext implements js.ExecutionContextDelegate {
     await this._session.send('Runtime.disposeObject', {
       executionContextId: this._executionContextId,
       objectId: handle._remoteObject.objectId,
-    }).catch(error => {
-      // Exceptions might happen in case of a page been navigated or closed.
-      // Swallow these since they are harmless and we don't leak anything in this case.
-      debugError(error);
-    });
+    }).catch(error => {});
   }
 
   async handleJSONValue<T>(handle: js.JSHandle<T>): Promise<T> {
@@ -159,13 +135,13 @@ export class FFExecutionContext implements js.ExecutionContextDelegate {
   }
 }
 
-function checkException(exceptionDetails?: any) {
-  if (exceptionDetails) {
-    if (exceptionDetails.value)
-      throw new Error('Evaluation failed: ' + JSON.stringify(exceptionDetails.value));
-    else
-      throw new Error('Evaluation failed: ' + exceptionDetails.text + '\n' + exceptionDetails.stack);
-  }
+function checkException(exceptionDetails?: Protocol.Runtime.ExceptionDetails) {
+  if (!exceptionDetails)
+    return;
+  if (exceptionDetails.value)
+    throw new Error('Evaluation failed: ' + JSON.stringify(exceptionDetails.value));
+  else
+    throw new Error('Evaluation failed: ' + exceptionDetails.text + '\n' + exceptionDetails.stack);
 }
 
 export function deserializeValue({unserializableValue, value}: Protocol.Runtime.RemoteObject) {

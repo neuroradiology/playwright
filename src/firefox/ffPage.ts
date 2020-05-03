@@ -15,43 +15,53 @@
  * limitations under the License.
  */
 
-import * as frames from '../frames';
-import { helper, RegisteredListener, debugError } from '../helper';
-import * as dom from '../dom';
-import { FFSession } from './ffConnection';
-import { FFExecutionContext } from './ffExecutionContext';
-import { Page, PageDelegate, Coverage, Worker } from '../page';
-import { FFNetworkManager } from './ffNetworkManager';
-import { Events } from '../events';
 import * as dialog from '../dialog';
-import { Protocol } from './protocol';
-import { RawMouseImpl, RawKeyboardImpl } from './ffInput';
-import { BrowserContext } from '../browserContext';
-import { getAccessibilityTree } from './ffAccessibility';
-import * as network from '../network';
-import * as types from '../types';
-import * as platform from '../platform';
+import * as dom from '../dom';
+import { Events } from '../events';
+import * as frames from '../frames';
+import { assert, helper, RegisteredListener } from '../helper';
+import { Page, PageBinding, PageDelegate, Worker } from '../page';
 import { kScreenshotDuringNavigationError } from '../screenshotter';
+import * as types from '../types';
+import { getAccessibilityTree } from './ffAccessibility';
+import { FFBrowserContext } from './ffBrowser';
+import { FFSession, FFSessionEvents } from './ffConnection';
+import { FFExecutionContext } from './ffExecutionContext';
+import { RawKeyboardImpl, RawMouseImpl } from './ffInput';
+import { FFNetworkManager, headersArray } from './ffNetworkManager';
+import { Protocol } from './protocol';
+import { selectors } from '../selectors';
+import { NotConnectedError } from '../errors';
+import { logError } from '../logger';
 
 const UTILITY_WORLD_NAME = '__playwright_utility_world__';
 
 export class FFPage implements PageDelegate {
+  readonly cspErrorsAsynchronousForInlineScipts = true;
   readonly rawMouse: RawMouseImpl;
   readonly rawKeyboard: RawKeyboardImpl;
   readonly _session: FFSession;
   readonly _page: Page;
   readonly _networkManager: FFNetworkManager;
+  readonly _browserContext: FFBrowserContext;
+  private _pagePromise: Promise<Page | Error>;
+  _pageCallback: (pageOrError: Page | Error) => void = () => {};
+  _initializedPage: Page | null = null;
+  readonly _opener: FFPage | null;
   private readonly _contextIdToContext: Map<string, dom.FrameExecutionContext>;
   private _eventListeners: RegisteredListener[];
   private _workers = new Map<string, { frameId: string, session: FFSession }>();
 
-  constructor(session: FFSession, browserContext: BrowserContext) {
+  constructor(session: FFSession, browserContext: FFBrowserContext, opener: FFPage | null) {
     this._session = session;
+    this._opener = opener;
     this.rawKeyboard = new RawKeyboardImpl(session);
     this.rawMouse = new RawMouseImpl(session);
     this._contextIdToContext = new Map();
+    this._browserContext = browserContext;
     this._page = new Page(this, browserContext);
     this._networkManager = new FFNetworkManager(session, this._page);
+    this._page.on(Events.Page.FrameDetached, frame => this._removeContextsForFrame(frame));
     this._eventListeners = [
       helper.addEventListener(this._session, 'Page.eventFired', this._onEventFired.bind(this)),
       helper.addEventListener(this._session, 'Page.frameAttached', this._onFrameAttached.bind(this)),
@@ -62,6 +72,8 @@ export class FFPage implements PageDelegate {
       helper.addEventListener(this._session, 'Page.sameDocumentNavigation', this._onSameDocumentNavigation.bind(this)),
       helper.addEventListener(this._session, 'Runtime.executionContextCreated', this._onExecutionContextCreated.bind(this)),
       helper.addEventListener(this._session, 'Runtime.executionContextDestroyed', this._onExecutionContextDestroyed.bind(this)),
+      helper.addEventListener(this._session, 'Page.linkClicked', event => this._onLinkClicked(event.phase)),
+      helper.addEventListener(this._session, 'Page.willOpenNewWindowAsynchronously', this._onWillOpenNewWindowAsynchronously.bind(this)),
       helper.addEventListener(this._session, 'Page.uncaughtError', this._onUncaughtError.bind(this)),
       helper.addEventListener(this._session, 'Runtime.console', this._onConsole.bind(this)),
       helper.addEventListener(this._session, 'Page.dialogOpened', this._onDialogOpened.bind(this)),
@@ -70,33 +82,21 @@ export class FFPage implements PageDelegate {
       helper.addEventListener(this._session, 'Page.workerCreated', this._onWorkerCreated.bind(this)),
       helper.addEventListener(this._session, 'Page.workerDestroyed', this._onWorkerDestroyed.bind(this)),
       helper.addEventListener(this._session, 'Page.dispatchMessageFromWorker', this._onDispatchMessageFromWorker.bind(this)),
+      helper.addEventListener(this._session, 'Page.crashed', this._onCrashed.bind(this)),
     ];
-  }
-
-  async _initialize() {
-    const promises: Promise<any>[] = [
-      this._session.send('Runtime.enable').then(() => this._ensureIsolatedWorld(UTILITY_WORLD_NAME)),
-      this._session.send('Network.enable'),
-      this._session.send('Page.enable'),
-      this._session.send('Page.setInterceptFileChooserDialog', { enabled: true })
-    ];
-    const options = this._page.browserContext()._options;
-    if (options.viewport)
-      promises.push(this.setViewport(options.viewport));
-    if (options.bypassCSP)
-      promises.push(this._session.send('Page.setBypassCSP', { enabled: true }));
-    if (options.javaScriptEnabled === false)
-      promises.push(this._session.send('Page.setJavascriptEnabled', { enabled: false }));
-    if (options.userAgent)
-      promises.push(this._session.send('Page.setUserAgent', { userAgent: options.userAgent }));
-    await Promise.all(promises);
-  }
-
-  async _ensureIsolatedWorld(name: string) {
-    await this._session.send('Page.addScriptToEvaluateOnNewDocument', {
-      script: '',
-      worldName: name,
+    this._pagePromise = new Promise(f => this._pageCallback = f);
+    session.once(FFSessionEvents.Disconnected, () => this._page._didDisconnect());
+    this._session.once('Page.ready', () => {
+      this._pageCallback(this._page);
+      this._initializedPage = this._page;
     });
+    // Ideally, we somehow ensure that utility world is created before Page.ready arrives, but currently it is racy.
+    // Therefore, we can end up with an initialized page without utility world, although very unlikely.
+    this._session.send('Page.addScriptToEvaluateOnNewDocument', { script: '', worldName: UTILITY_WORLD_NAME }).catch(this._pageCallback);
+  }
+
+  async pageOrError(): Promise<Page | Error> {
+    return this._pagePromise;
   }
 
   _onExecutionContextCreated(payload: Protocol.Runtime.executionContextCreatedPayload) {
@@ -119,16 +119,36 @@ export class FFPage implements PageDelegate {
     if (!context)
       return;
     this._contextIdToContext.delete(executionContextId);
-    context.frame._contextDestroyed(context as dom.FrameExecutionContext);
+    context.frame._contextDestroyed(context);
   }
 
-  _onNavigationStarted() {
+  private _removeContextsForFrame(frame: frames.Frame) {
+    for (const [contextId, context] of this._contextIdToContext) {
+      if (context.frame === frame)
+        this._contextIdToContext.delete(contextId);
+    }
+  }
+
+  _onLinkClicked(phase: 'before' | 'after') {
+    if (phase === 'before')
+      this._page._frameManager.frameWillPotentiallyRequestNavigation();
+    else
+      this._page._frameManager.frameDidPotentiallyRequestNavigation();
+  }
+
+  _onWillOpenNewWindowAsynchronously() {
+    for (const barrier of this._page._frameManager._signalBarriers)
+      barrier.expectPopup();
+  }
+
+  _onNavigationStarted(params: Protocol.Page.navigationStartedPayload) {
+    this._page._frameManager.frameRequestedNavigation(params.frameId, params.navigationId);
   }
 
   _onNavigationAborted(params: Protocol.Page.navigationAbortedPayload) {
     const frame = this._page._frameManager.frame(params.frameId)!;
-    for (const watcher of this._page._frameManager._lifecycleWatchers)
-      watcher._onAbortedNewDocumentNavigation(frame, params.navigationId, params.errorText);
+    for (const task of frame._frameTasks)
+      task.onNewDocument(params.navigationId, new Error(params.errorText));
   }
 
   _onNavigationCommitted(params: Protocol.Page.navigationCommittedPayload) {
@@ -160,7 +180,8 @@ export class FFPage implements PageDelegate {
   }
 
   _onUncaughtError(params: Protocol.Page.uncaughtErrorPayload) {
-    const error = new Error(params.message);
+    const message = params.message.startsWith('Error: ') ? params.message.substring(7) : params.message;
+    const error = new Error(message);
     error.stack = params.stack;
     this._page.emit(Events.Page.PageError, error);
   }
@@ -173,12 +194,12 @@ export class FFPage implements PageDelegate {
 
   _onDialogOpened(params: Protocol.Page.dialogOpenedPayload) {
     this._page.emit(Events.Page.Dialog, new dialog.Dialog(
-      params.type as dialog.DialogType,
-      params.message,
-      async (accept: boolean, promptText?: string) => {
-        await this._session.send('Page.handleDialog', { dialogId: params.dialogId, accept, promptText }).catch(debugError);
-      },
-      params.defaultValue));
+        params.type,
+        params.message,
+        async (accept: boolean, promptText?: string) => {
+          await this._session.send('Page.handleDialog', { dialogId: params.dialogId, accept, promptText }).catch(logError(this._page));
+        },
+        params.defaultValue));
   }
 
   _onBindingCalled(event: Protocol.Page.bindingCalledPayload) {
@@ -195,7 +216,7 @@ export class FFPage implements PageDelegate {
 
   async _onWorkerCreated(event: Protocol.Page.workerCreatedPayload) {
     const workerId = event.workerId;
-    const worker = new Worker(event.url);
+    const worker = new Worker(this._page, event.url);
     const workerSession = new FFSession(this._session._connection, 'worker', workerId, (message: any) => {
       this._session.send('Page.sendMessageToWorker', {
         frameId: event.frameId,
@@ -223,7 +244,7 @@ export class FFPage implements PageDelegate {
     const worker = this._workers.get(workerId);
     if (!worker)
       return;
-    worker.session._onClosed();
+    worker.session.dispose();
     this._workers.delete(workerId);
     this._page._removeWorker(workerId);
   }
@@ -235,13 +256,17 @@ export class FFPage implements PageDelegate {
     worker.session.dispatchMessage(JSON.parse(event.message));
   }
 
-  async exposeBinding(name: string, bindingFunction: string): Promise<void> {
-    await this._session.send('Page.addBinding', {name: name});
-    await this._session.send('Page.addScriptToEvaluateOnNewDocument', {script: bindingFunction});
-    await Promise.all(this._page.frames().map(frame => frame.evaluate(bindingFunction).catch(debugError)));
+  async _onCrashed(event: Protocol.Page.crashedPayload) {
+    this._session.markAsCrashed();
+    this._page._didCrash();
+  }
+
+  async exposeBinding(binding: PageBinding) {
+    await this._session.send('Page.addBinding', { name: binding.name, script: binding.source });
   }
 
   didClose() {
+    this._session.dispose();
     helper.removeEventListeners(this._eventListeners);
     this._networkManager.dispose();
     this._page._didClose();
@@ -249,53 +274,46 @@ export class FFPage implements PageDelegate {
 
   async navigateFrame(frame: frames.Frame, url: string, referer: string | undefined): Promise<frames.GotoResult> {
     const response = await this._session.send('Page.navigate', { url, referer, frameId: frame._id });
-    return { newDocumentId: response.navigationId || undefined, isSameDocument: !response.navigationId };
+    return { newDocumentId: response.navigationId || undefined };
   }
 
-  needsLifecycleResetOnSetContent(): boolean {
-    return true;
+  async updateExtraHTTPHeaders(): Promise<void> {
+    await this._session.send('Network.setExtraHTTPHeaders', { headers: headersArray(this._page._state.extraHTTPHeaders || {}) });
   }
 
-  async setExtraHTTPHeaders(headers: network.Headers): Promise<void> {
-    const array = [];
-    for (const [name, value] of Object.entries(headers))
-      array.push({ name, value });
-    await this._session.send('Network.setExtraHTTPHeaders', { headers: array });
-  }
-
-  async setViewport(viewport: types.Viewport): Promise<void> {
-    const {
-      width,
-      height,
-      isMobile = false,
-      deviceScaleFactor = 1,
-    } = viewport;
-    await this._session.send('Page.setViewport', {
-      viewport: { width, height, isMobile, deviceScaleFactor, hasTouch: isMobile, isLandscape: width > height },
+  async setViewportSize(viewportSize: types.Size): Promise<void> {
+    assert(this._page._state.viewportSize === viewportSize);
+    await this._session.send('Page.setViewportSize', {
+      viewportSize: {
+        width: viewportSize.width,
+        height: viewportSize.height,
+      },
     });
   }
 
-  async setEmulateMedia(mediaType: types.MediaType | null, colorScheme: types.ColorScheme | null): Promise<void> {
+  async updateEmulateMedia(): Promise<void> {
+    const colorScheme = this._page._state.colorScheme || this._browserContext._options.colorScheme || 'light';
     await this._session.send('Page.setEmulatedMedia', {
-      type: mediaType === null ? undefined : mediaType,
-      colorScheme: colorScheme === null ? undefined : colorScheme
+      type: this._page._state.mediaType === null ? undefined : this._page._state.mediaType,
+      colorScheme
     });
   }
 
-  async setCacheEnabled(enabled: boolean): Promise<void> {
-    await this._session.send('Page.setCacheDisabled', {cacheDisabled: !enabled});
+  async updateRequestInterception(): Promise<void> {
+    await this._networkManager.setRequestInterception(this._page._needsRequestInterception());
   }
 
-  async setRequestInterception(enabled: boolean): Promise<void> {
-    await this._networkManager.setRequestInterception(enabled);
+  async setFileChooserIntercepted(enabled: boolean) {
+    await this._session.send('Page.setInterceptFileChooserDialog', { enabled }).catch(e => {}); // target can be closed.
   }
 
-  async setOfflineMode(enabled: boolean): Promise<void> {
-    throw new Error('Offline mode not implemented in Firefox');
-  }
-
-  async authenticate(credentials: types.Credentials): Promise<void> {
-    throw new Error('Offline mode not implemented in Firefox');
+  async opener(): Promise<Page | null> {
+    if (!this._opener)
+      return null;
+    const result = await this._opener.pageOrError();
+    if (result instanceof Page && !result.isClosed())
+      return result;
+    return null;
   }
 
   async reload(): Promise<void> {
@@ -320,15 +338,6 @@ export class FFPage implements PageDelegate {
     await this._session.send('Page.close', { runBeforeUnload });
   }
 
-  async getBoundingBoxForScreenshot(handle: dom.ElementHandle<Node>): Promise<types.Rect | null> {
-    const frameId = handle._context.frame._id;
-    const response = await this._session.send('Page.getBoundingBox', {
-      frameId,
-      objectId: handle._remoteObject.objectId,
-    });
-    return response.boundingBox;
-  }
-
   canScreenshotOutsideViewport(): boolean {
     return true;
   }
@@ -338,21 +347,32 @@ export class FFPage implements PageDelegate {
       throw new Error('Not implemented');
   }
 
-  async takeScreenshot(format: 'png' | 'jpeg', options: types.ScreenshotOptions): Promise<platform.BufferType> {
+  async takeScreenshot(format: 'png' | 'jpeg', documentRect: types.Rect | undefined, viewportRect: types.Rect | undefined, quality: number | undefined): Promise<Buffer> {
+    if (!documentRect) {
+      const context = await this._page.mainFrame()._utilityContext();
+      const scrollOffset = await context.evaluateInternal(() => ({ x: window.scrollX, y: window.scrollY }));
+      documentRect = {
+        x: viewportRect!.x + scrollOffset.x,
+        y: viewportRect!.y + scrollOffset.y,
+        width: viewportRect!.width,
+        height: viewportRect!.height,
+      };
+    }
+    // TODO: remove fullPage option from Page.screenshot.
+    // TODO: remove Page.getBoundingBox method.
     const { data } = await this._session.send('Page.screenshot', {
       mimeType: ('image/' + format) as ('image/png' | 'image/jpeg'),
-      fullPage: options.fullPage,
-      clip: options.clip,
+      clip: documentRect,
     }).catch(e => {
       if (e instanceof Error && e.message.includes('document.documentElement is null'))
         e.message = kScreenshotDuringNavigationError;
       throw e;
     });
-    return platform.Buffer.from(data, 'base64');
+    return Buffer.from(data, 'base64');
   }
 
   async resetViewport(): Promise<void> {
-    await this._session.send('Page.setViewport', { viewport: null });
+    assert(false, 'Should not be called');
   }
 
   async getContentFrame(handle: dom.ElementHandle): Promise<frames.Frame | null> {
@@ -365,14 +385,12 @@ export class FFPage implements PageDelegate {
     return this._page._frameManager.frame(contentFrameId);
   }
 
-  async getOwnerFrame(handle: dom.ElementHandle): Promise<frames.Frame | null> {
+  async getOwnerFrame(handle: dom.ElementHandle): Promise<string | null> {
     const { ownerFrameId } = await this._session.send('Page.describeNode', {
       frameId: handle._context.frame._id,
       objectId: toRemoteObject(handle).objectId!,
     });
-    if (!ownerFrameId)
-      return null;
-    return this._page._frameManager.frame(ownerFrameId);
+    return ownerFrameId || null;
   }
 
   isElementHandle(remoteObject: any): boolean {
@@ -398,11 +416,26 @@ export class FFPage implements PageDelegate {
     return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
   }
 
+  async scrollRectIntoViewIfNeeded(handle: dom.ElementHandle, rect?: types.Rect): Promise<void> {
+    await this._session.send('Page.scrollIntoViewIfNeeded', {
+      frameId: handle._context.frame._id,
+      objectId: toRemoteObject(handle).objectId!,
+      rect,
+    }).catch(e => {
+      if (e instanceof Error && e.message.includes('Node is detached from document'))
+        throw new NotConnectedError();
+      throw e;
+    });
+  }
+
+  async setActivityPaused(paused: boolean): Promise<void> {
+  }
+
   async getContentQuads(handle: dom.ElementHandle): Promise<types.Quad[] | null> {
     const result = await this._session.send('Page.getContentQuads', {
       frameId: handle._context.frame._id,
       objectId: toRemoteObject(handle).objectId!,
-    }).catch(debugError);
+    }).catch(logError(this._page));
     if (!result)
       return null;
     return result.quads.map(quad => [ quad.p1, quad.p2, quad.p3, quad.p4 ]);
@@ -413,7 +446,8 @@ export class FFPage implements PageDelegate {
   }
 
   async setInputFiles(handle: dom.ElementHandle<HTMLInputElement>, files: types.FilePayload[]): Promise<void> {
-    await handle.evaluate(dom.setFileInputFunction, files);
+    await handle._evaluateInUtility(({ injected, node }, files) =>
+      injected.setInputFiles(node, files), dom.toFileTransferPayload(files));
   }
 
   async adoptElementHandle<T extends Node>(handle: dom.ElementHandle<T>, to: dom.FrameExecutionContext): Promise<dom.ElementHandle<T>> {
@@ -422,6 +456,8 @@ export class FFPage implements PageDelegate {
       objectId: toRemoteObject(handle).objectId!,
       executionContextId: (to._delegate as FFExecutionContext)._executionContextId
     });
+    if (!result.remoteObject)
+      throw new Error('Unable to adopt element handle from a different document');
     return to._createHandle(result.remoteObject) as dom.ElementHandle<T>;
   }
 
@@ -429,19 +465,24 @@ export class FFPage implements PageDelegate {
     return getAccessibilityTree(this._session, needle);
   }
 
-  coverage(): Coverage | undefined {
-    return undefined;
+  async inputActionEpilogue(): Promise<void> {
   }
-}
 
-export function normalizeWaitUntil(waitUntil: frames.LifecycleEvent | frames.LifecycleEvent[]): frames.LifecycleEvent[] {
-  if (!Array.isArray(waitUntil))
-    waitUntil = [waitUntil];
-  for (const condition of waitUntil) {
-    if (condition !== 'load' && condition !== 'domcontentloaded')
-      throw new Error('Unknown waitUntil condition: ' + condition);
+  async getFrameElement(frame: frames.Frame): Promise<dom.ElementHandle> {
+    const parent = frame.parentFrame();
+    if (!parent)
+      throw new Error('Frame has been detached.');
+    const handles = await selectors._queryAll(parent, 'iframe', undefined, true /* allowUtilityContext */);
+    const items = await Promise.all(handles.map(async handle => {
+      const frame = await handle.contentFrame().catch(e => null);
+      return { handle, frame };
+    }));
+    const result = items.find(item => item.frame === frame);
+    items.map(item => item === result ? Promise.resolve() : item.handle.dispose());
+    if (!result)
+      throw new Error('Frame has been detached.');
+    return result.handle;
   }
-  return waitUntil;
 }
 
 function toRemoteObject(handle: dom.ElementHandle): Protocol.Runtime.RemoteObject {

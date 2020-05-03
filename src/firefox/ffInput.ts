@@ -64,13 +64,17 @@ export class RawKeyboardImpl implements input.RawKeyboard {
       code = 'OSLeft';
     if (code === 'MetaRight')
       code = 'OSRight';
+    // Firefox will figure out Enter by itself
+    if (text === '\r')
+      text = '';
     await this._client.send('Page.dispatchKeyEvent', {
       type: 'keydown',
       keyCode: keyCodeWithoutLocation,
       code,
       key,
       repeat: autoRepeat,
-      location
+      location,
+      text,
     });
   }
 

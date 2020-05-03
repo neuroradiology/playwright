@@ -589,7 +589,7 @@ class Engine {
           appendCue(`img[alt=${JSON.stringify(alt)}]`, 'imgAlt', this.options.imgAltScore, element, lca, alt);
       }
       if (this.options.ariaLabelScore) {
-        const ariaLabel = element.getAttribute('aira-label');
+        const ariaLabel = element.getAttribute('aria-label');
         if (ariaLabel)
           appendCue(JSON.stringify(`[aria-label=${JSON.stringify(ariaLabel)}]`), 'ariaLabel', this.options.ariaLabelScore, element, lca, ariaLabel);
       }
@@ -751,8 +751,6 @@ class Engine {
 }
 
 const ZSSelectorEngine: SelectorEngine = {
-  name: 'zs',
-
   create(root: SelectorRoot, element: Element, type?: SelectorType): string {
     return new Engine().create(root, element, type || 'default');
   },
@@ -780,9 +778,9 @@ const ZSSelectorEngine: SelectorEngine = {
     while (e && e.namespaceURI && e.namespaceURI.endsWith('svg') && e.nodeName.toLowerCase() !== 'svg')
       e = e.parentElement!;
     try {
-      document.documentElement!.style!.outline = '1px solid red';
+      document.documentElement.style.outline = '1px solid red';
       const selector = new Engine().create(document.documentElement, e, 'default');
-      document.documentElement!.style!.outline = '1px solid green';
+      document.documentElement.style.outline = '1px solid green';
       const e2 = new Engine().query(document.documentElement, selector, false)[0];
       return e !== e2;
     } catch (e) {

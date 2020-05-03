@@ -32,13 +32,10 @@ trap "cd $(pwd -P)" EXIT
 cd "$(dirname $0)"
 cd checkout
 
-OBJ_FOLDER=$(ls -1 | grep obj-)
-if [[ $OBJ_FOLDER == "" ]]; then
-  echo "ERROR: cannot find obj-* folder in the checkout/. Did you build?"
-  exit 1;
-fi
+OBJ_FOLDER="obj-build-playwright"
 
 ./mach package
+node ../install-preferences.js $PWD/$OBJ_FOLDER/dist/firefox
 
 if ! [[ -d $OBJ_FOLDER/dist/firefox ]]; then
   echo "ERROR: cannot find $OBJ_FOLDER/dist/firefox folder in the checkout/. Did you build?"

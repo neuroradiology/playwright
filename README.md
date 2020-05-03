@@ -1,110 +1,98 @@
-# Playwright
-[![npm version](https://img.shields.io/npm/v/playwright.svg?style=flat)](https://www.npmjs.com/package/playwright) [![Chromium version](https://img.shields.io/badge/chromium-81.0.4032-blue.svg)](https://www.chromium.org/Home) [![Firefox version](https://img.shields.io/badge/firefox-73.0b3-blue.svg)](https://www.mozilla.org/en-US/firefox/new/) [![WebKit version](https://img.shields.io/badge/webkit-13.0.4-blue.svg)](https://webkit.org/) [![Join Slack](https://img.shields.io/badge/join-slack-infomational)](https://join.slack.com/t/playwright/shared_invite/enQtOTEyMTUxMzgxMjIwLThjMDUxZmIyNTRiMTJjNjIyMzdmZDA3MTQxZWUwZTFjZjQwNGYxZGM5MzRmNzZlMWI5ZWUyOTkzMjE5Njg1NDg)
+# 🎭 Playwright 
 
-###### [API](https://github.com/microsoft/playwright/blob/master/docs/api.md) | [FAQ](#faq) | [Contributing](#contributing)
+[![npm version](https://img.shields.io/npm/v/playwright.svg?style=flat)](https://www.npmjs.com/package/playwright) [![Join Slack](https://img.shields.io/badge/join-slack-infomational)](https://join.slack.com/t/playwright/shared_invite/enQtOTEyMTUxMzgxMjIwLThjMDUxZmIyNTRiMTJjNjIyMzdmZDA3MTQxZWUwZTFjZjQwNGYxZGM5MzRmNzZlMWI5ZWUyOTkzMjE5Njg1NDg) <!-- GEN:chromium-version-badge -->[![Chromium version](https://img.shields.io/badge/chromium-84.0.4131.0-blue.svg?logo=google-chrome)](https://www.chromium.org/Home)<!-- GEN:stop --> <!-- GEN:firefox-version-badge -->[![Firefox version](https://img.shields.io/badge/firefox-76.0b5-blue.svg?logo=mozilla-firefox)](https://www.mozilla.org/en-US/firefox/new/)<!-- GEN:stop --> [![WebKit version](https://img.shields.io/badge/webkit-13.0.4-blue.svg?logo=safari)](https://webkit.org/)
 
+##### [Docs](docs/README.md) | [API reference](docs/api.md) | [Changelog](https://github.com/microsoft/playwright/releases)
 
-Playwright is a Node library to automate the [Chromium](https://www.chromium.org/Home), [WebKit](https://webkit.org/) and [Firefox](https://www.mozilla.org/en-US/firefox/new/) browsers. Playwright is focused on enabling **cross-browser** web automation platform that is **ever-green**, **capable**, **reliable** and **fast**. Our primary goal with Playwright is to improve automated UI testing by eliminating flakiness, improving the speed of execution and offering insights into the browser operation.
+Playwright is a Node library to automate [Chromium](https://www.chromium.org/Home), [Firefox](https://www.mozilla.org/en-US/firefox/new/) and [WebKit](https://webkit.org/) with a single API. Playwright is built to enable cross-browser web automation that is **ever-green**, **capable**, **reliable** and **fast**.
 
+|          | Linux | macOS | Windows |
+|   :---   | :---: | :---: | :---:   |
+| Chromium <!-- GEN:chromium-version -->84.0.4131.0<!-- GEN:stop --> | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| WebKit 13.0.4 | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Firefox <!-- GEN:firefox-version -->76.0b5<!-- GEN:stop --> | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 
-|          | ver | Linux | macOS | Win |
-|   ---:   | :---: | :---: | :---:  | :---: |
-| Chromium| 81.0.4032 | :white_check_mark: | :white_check_mark: | :white_check_mark: |
-| WebKit | 13.0.4 | :white_check_mark: | :white_check_mark: | :white_check_mark: |
-| Firefox |73.0b3 | :white_check_mark: | :white_check_mark: | :white_check_mark: |
-- Headless is supported for all browsers on all platforms.
+Headless execution is supported for all the browsers on all platforms.
 
-### Installation
+## Usage
 
 ```
 npm i playwright
 ```
 
-This installs Playwright along with its dependencies and the browser binaries. Browser binaries are about 50-100MB each, so expect the installation network traffic to be substantial.
+This installs Playwright and browser binaries for Chromium, Firefox and WebKit. Once installed, you can `require` Playwright in a Node.js script and automate web browser interactions.
 
-### Usage
+* [Getting started](docs/intro.md)
+* [Installation configuration](docs/installation.md)
+* [API reference](docs/api.md)
 
-Playwright can be used to create a browser instance, open pages, and then manipulate them. See [API docs](https://github.com/microsoft/playwright/blob/master/docs/api.md) for a comprehensive list.
+## Capabilities
 
-### Examples
+Playwright is built to automate the broad and growing set of web browser capabilities used by Single Page Apps and Progressive Web Apps.
+
+* Scenarios that span multiple page, domains and iframes
+* Auto-wait for elements to be ready before executing actions (like click, fill)
+* Intercept network activity for stubbing and mocking network requests
+* Emulate mobile devices, geolocation, permissions
+* Native input events for mouse and keyboard
+* Upload and download files
+
+## Examples
 
 #### Page screenshot
 
-This code snippet navigates to example.com in WebKit, and saves a screenshot.
+This code snippet navigates to whatsmyuseragent.org in Chromium, Firefox and WebKit, and saves 3 screenshots.
 
 ```js
-const pw = require('playwright');
+const playwright = require('playwright');
 
 (async () => {
-  const browser = await pw.webkit.launch(); // or 'chromium', 'firefox'
-  const context = await browser.newContext();
-  const page = await context.newPage();
-
-  await page.goto('https://www.example.com/');
-  await page.screenshot({ path: 'example.png' });
-
-  await browser.close();
+  for (const browserType of ['chromium', 'firefox', 'webkit']) {
+    const browser = await playwright[browserType].launch();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto('http://whatsmyuseragent.org/');
+    await page.screenshot({ path: `example-${browserType}.png` });
+    await browser.close();
+  }
 })();
 ```
+
+#### Mobile and geolocation
 
 This snippet emulates Mobile Safari on a device at a given geolocation, navigates to maps.google.com, performs action and takes a screenshot.
 
 ```js
-const pw = require('playwright');
-const iPhone11 = pw.devices['iPhone 11 Pro'];
+const { webkit, devices } = require('playwright');
+const iPhone11 = devices['iPhone 11 Pro'];
 
 (async () => {
-  const browser = await pw.webkit.launch();
+  const browser = await webkit.launch();
   const context = await browser.newContext({
-    viewport: iPhone11.viewport,
-    userAgent: iPhone11.userAgent,
+    ...iPhone11,
     geolocation: { longitude: 12.492507, latitude: 41.889938 },
-    permissions: { 'https://www.google.com': ['geolocation'] }
+    permissions: ['geolocation']
   });
-
-  const page = await context.newPage('https://maps.google.com');
+  const page = await context.newPage();
+  await page.goto('https://maps.google.com');
   await page.click('text="Your location"');
   await page.waitForRequest(/.*preview\/pwa/);
-  await page.screenshot({ path: 'colosseum-iphone.png' });  
+  await page.screenshot({ path: 'colosseum-iphone.png' });
   await browser.close();
 })();
 ```
 
-And here is the same script for Chrome on Android.
-
-```js
-const pw = require('playwright');
-const pixel2 = pw.devices['Pixel 2'];
-
-(async () => {
-  const browser = await pw.chromium.launch();
-  const context = await browser.newContext({
-    viewport: pixel2.viewport,
-    userAgent: pixel2.userAgent,
-    geolocation: { longitude: 12.492507, latitude: 41.889938 },
-    permissions: { 'https://www.google.com': ['geolocation'] }
-  });
-
-  const page = await context.newPage('https://maps.google.com');
-  await page.click('text="Your location"');
-  await page.waitForRequest(/.*pwa\/net.js.*/);
-  await page.screenshot({ path: 'colosseum-android.png' });
-  await browser.close();
-})();
-```
-
-#### Evaluate script
+#### Evaluate in browser context
 
 This code snippet navigates to example.com in Firefox, and executes a script in the page context.
 
 ```js
-const pw = require('playwright');
+const { firefox } = require('playwright');
 
 (async () => {
-  const browser = await pw.firefox.launch(); // or 'chromium', 'webkit'
+  const browser = await firefox.launch();
   const context = await browser.newContext();
   const page = await context.newPage();
-
   await page.goto('https://www.example.com/');
   const dimensions = await page.evaluate(() => {
     return {
@@ -119,50 +107,33 @@ const pw = require('playwright');
 })();
 ```
 
-## Contributing
+#### Intercept network requests
 
-Check out our [contributing guide](https://github.com/microsoft/playwright/blob/master/CONTRIBUTING.md).
+This code snippet sets up request routing for a WebKit page to log all network requests.
 
-## FAQ
+```js
+const { webkit } = require('playwright');
 
-**Q: How does Playwright relate to [Puppeteer](https://github.com/puppeteer/puppeteer)?**
+(async () => {
+  const browser = await webkit.launch();
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
-We are the same team that built Puppeteer. Puppeteer proved that there is a lot of interest in the new generation of ever-green, capable and reliable automation drivers. With Playwright, we'd like to take it one step further and offer the same functionality for **all** the popular rendering engines. We'd like to see Playwright vendor-neutral and shared governed.
+  // Log and continue all network requests
+  page.route('**', route => {
+    console.log(route.request().url());
+    route.continue();
+  });
 
-With Playwright, we are making the APIs more testing-friendly as well. We are taking the lessons learned from Puppeteer and incorporate them into the API, for example, user agent / device emulation is set up consistently on the `BrowserContext` level to enable multi-page scenarios, `click` waits for the element to be available and visible by default, there is a way to wait for network and other events, etc.
-
-Playwright also aims at being cloud-native. Rather than a single page, `BrowserContext` abstraction is now central to the library operation. `BrowserContext`s are isolated, they can be either created locally or provided as a service.
-
-All the changes and improvements above would require breaking changes to the Puppeteer API, so we chose to start with a clean slate instead. Due to the similarity of the concepts and the APIs, migration between the two should be a mechanical task.
-
-**Q: What about the [WebDriver](https://www.w3.org/TR/webdriver/)?**
-
-We recognize WebDriver as a universal standard for the web automation and testing. At the same time we were excited to see Puppeteer affect the WebDriver agenda, steer it towards the bi-directional communication channel, etc. We hope that Playwright can take it further and pioneer support for numerous PWA features across the browsers as they emerge:
-
-- [*capabilities*] With Playwright, we aim at providing a more capable driver, including support for [mobile viewports](https://developer.mozilla.org/en-US/docs/Mozilla/Mobile/Viewport_meta_tag), [touch](https://developer.mozilla.org/en-US/docs/Web/API/Touch_events/Using_Touch_Events), [web](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers) & [service workers](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API), [geolocation](https://developer.mozilla.org/en-US/docs/Web/API/Geolocation_API), [csp](https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP), [cookie policies](https://web.dev/samesite-cookies-explained/), [permissions](https://developer.mozilla.org/en-US/docs/Web/API/Permissions_API), [accessibility](https://developer.mozilla.org/en-US/docs/Web/Accessibility), etc.
-
-- [*ergonomics*] We continue the trend set with Puppeteer and provide ergonomically-sound APIs for frames, workers, handles, etc.
-
-- [*reliability*] With Playwright, we encourage `setTimeout`-free automation. The notion of the wall time is incompatible with the operation in the cloud / CI. It is a major source of flakiness and pain and we would like to provide an alternative. With that, Playwright aims at providing sufficient amount of events based on the browser instrumentation to make it possible.
-
-**Q: What browser versions does Playwright use?**
-
-- *Chromium*: Playwright uses upstream versions of Chromium. When we need changes in the browser, they go into the browser directly and then we roll our dependency to that version of Chromium. As of today, we update Chromium as needed or at least once a month. We plan to synchronize our npm release cycle with the Chromium stable channel cadence.
-
-- *WebKit*: Playwright makes a number of modifications to `WebCore` and `WebKit2` in order to extend WebKit's remote debugging capabilities and support the full set of Playwright APIs. It also modifies the `Minibrowser` embedders to allow headless operation and headful debugging on all platforms. We use WebKit2 in a modern process isolation mode, enable mobile viewport, touch and geolocation on non-iOS platforms, etc. etc.
-
-  We'd like to switch to the upstream-first mode of operation, so we will be offering all of the WebKit patches for review upstream. Until then, they can be found in the `browser_patches/webkit` folder.
-
-- *Firefox*: Playwright makes a number of modifications to Firefox as well. Those are adding support for content script debugging, workers, CSP, emulation, network interception, etc. etc.
-
-  Similarly to WebKit, we'd like to offer all of those for review upstream, for now they can be found in the `browser_patches/firefox` folder.
-
-**Q: Is Playwright ready?**
-
-Playwright is ready for your feedback. It respects [semver](https://semver.org/), so please expect some API breakages as we release 1.0. All we can promise is that those breakages are going to be based on your feedback with the sole purpose of making our APIs better.
-
-Playwright is being actively developed as we get to the feature parity across Chromium, Firefox and WebKit. Progress on each browser can be tracked on the [Is Playwright Ready?](https://aslushnikov.github.io/isplaywrightready/) page, which shows currently failing tests per browser.
+  await page.goto('http://todomvc.com');
+  await browser.close();
+})();
+```
 
 ## Resources
 
-* [API documentation](https://github.com/microsoft/playwright/blob/master/docs/api.md)
+* [Documentation](docs/README.md)
+* [API reference](docs/api.md)
+* [Example recipes](docs/examples/README.md)
+* [Contributing](CONTRIBUTING.md)
+* [Community showcase](docs/showcase.md)

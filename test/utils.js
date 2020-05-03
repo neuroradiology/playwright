@@ -17,79 +17,19 @@
 
 const fs = require('fs');
 const path = require('path');
+const util = require('util');
+const os = require('os');
+const removeFolder = require('rimraf');
+
 const {FlakinessDashboard} = require('../utils/flakiness-dashboard');
 const PROJECT_ROOT = fs.existsSync(path.join(__dirname, '..', 'package.json')) ? path.join(__dirname, '..') : path.join(__dirname, '..', '..');
 
-const COVERAGE_TESTSUITE_NAME = '**API COVERAGE**';
+const mkdtempAsync = util.promisify(require('fs').mkdtemp);
+const removeFolderAsync = util.promisify(removeFolder);
 
-/**
- * @param {Map<string, boolean>} apiCoverage
- * @param {Object} events
- * @param {string} className
- * @param {!Object} classType
- */
-function traceAPICoverage(apiCoverage, events, className, classType) {
-  className = className.substring(0, 1).toLowerCase() + className.substring(1);
-  for (const methodName of Reflect.ownKeys(classType.prototype)) {
-    const method = Reflect.get(classType.prototype, methodName);
-    if (methodName === 'constructor' || typeof methodName !== 'string' || methodName.startsWith('_') || typeof method !== 'function')
-      continue;
-    apiCoverage.set(`${className}.${methodName}`, false);
-    Reflect.set(classType.prototype, methodName, function(...args) {
-      apiCoverage.set(`${className}.${methodName}`, true);
-      return method.call(this, ...args);
-    });
-  }
-
-  if (events[classType.name]) {
-    for (const event of Object.values(events[classType.name])) {
-      if (typeof event !== 'symbol')
-        apiCoverage.set(`${className}.emit(${JSON.stringify(event)})`, false);
-    }
-    const method = Reflect.get(classType.prototype, 'emit');
-    Reflect.set(classType.prototype, 'emit', function(event, ...args) {
-      if (typeof event !== 'symbol' && this.listenerCount(event))
-        apiCoverage.set(`${className}.emit(${JSON.stringify(event)})`, true);
-      return method.call(this, event, ...args);
-    });
-  }
-}
+let platform = os.platform();
 
 const utils = module.exports = {
-  promisify: function (nodeFunction) {
-    function promisified(...args) {
-      return new Promise((resolve, reject) => {
-        function callback(err, ...result) {
-          if (err)
-            return reject(err);
-          if (result.length === 1)
-            return resolve(result[0]);
-          return resolve(result);
-        }
-        nodeFunction.call(null, ...args, callback);
-      });
-    }
-    return promisified;
-  },
-
-  recordAPICoverage: function(testRunner, api, events) {
-    const coverage = new Map();
-    for (const [className, classType] of Object.entries(api))
-      traceAPICoverage(coverage, events, className, classType);
-    const focus = testRunner.hasFocusedTestsOrSuites();
-    (focus ? testRunner.fdescribe : testRunner.describe)(COVERAGE_TESTSUITE_NAME, () => {
-      (focus ? testRunner.fit : testRunner.it)('should call all API methods', () => {
-        const missingMethods = [];
-        for (const method of coverage.keys()) {
-          if (!coverage.get(method))
-            missingMethods.push(method);
-        }
-        if (missingMethods.length)
-          throw new Error('Certain API Methods are not called: ' + missingMethods.join(', '));
-      });
-    });
-  },
-
   /**
    * @return {string}
    */
@@ -104,27 +44,15 @@ const utils = module.exports = {
    * @return {!Playwright.Frame}
    */
   attachFrame: async function(page, frameId, url) {
-    const frames = new Set(page.frames());
-    const handle = await page.evaluateHandle(attachFrame, frameId, url);
-    try {
-      return await handle.asElement().contentFrame();
-    } catch(e) {
-      // we might not support contentFrame, but this can still work ok.
-      for (const frame of page.frames()) {
-        if (!frames.has(frame))
-          return frame;
-      }
-    }
-    return null;
-
-    async function attachFrame(frameId, url) {
+    const handle = await page.evaluateHandle(async ({ frameId, url }) => {
       const frame = document.createElement('iframe');
       frame.src = url;
       frame.id = frameId;
       document.body.appendChild(frame);
       await new Promise(x => frame.onload = x);
       return frame;
-    }
+    }, { frameId, url });
+    return handle.asElement().contentFrame();
   },
 
   /**
@@ -132,27 +60,9 @@ const utils = module.exports = {
    * @param {string} frameId
    */
   detachFrame: async function(page, frameId) {
-    await page.evaluate(detachFrame, frameId);
-
-    function detachFrame(frameId) {
-      const frame = document.getElementById(frameId);
-      frame.remove();
-    }
-  },
-
-  /**
-   * @param {!Page} page
-   * @param {string} frameId
-   * @param {string} url
-   */
-  navigateFrame: async function(page, frameId, url) {
-    await page.evaluate(navigateFrame, frameId, url);
-
-    function navigateFrame(frameId, url) {
-      const frame = document.getElementById(frameId);
-      frame.src = url;
-      return new Promise(x => frame.onload = x);
-    }
+    await page.evaluate(frameId => {
+      document.getElementById(frameId).remove();
+    }, frameId);
   },
 
   /**
@@ -177,22 +87,6 @@ const utils = module.exports = {
     return result;
   },
 
-  /**
-   * @param {!EventEmitter} emitter
-   * @param {string} eventName
-   * @return {!Promise<!Object>}
-   */
-  waitEvent: function(emitter, eventName, predicate = () => true) {
-    return new Promise(fulfill => {
-      emitter.on(eventName, function listener(event) {
-        if (!predicate(event))
-          return;
-        emitter.removeListener(eventName, listener);
-        fulfill(event);
-      });
-    });
-  },
-
   initializeFlakinessDashboardIfNeeded: async function(testRunner) {
     // Generate testIDs for all tests and verify they don't clash.
     // This will add |test.testId| for every test.
@@ -209,7 +103,7 @@ const utils = module.exports = {
     //   from someone who has WRITE ACCESS to the repo.
     //
     // Since we don't want to run flakiness dashboard for PRs on all CIs, we
-    // check existance of FLAKINESS_DASHBOARD_PASSWORD and absense of
+    // check existence of FLAKINESS_DASHBOARD_PASSWORD and absence of
     // CIRRUS_BASE_SHA env variables.
     if (!process.env.FLAKINESS_DASHBOARD_PASSWORD || process.env.CIRRUS_BASE_SHA)
       return;
@@ -235,14 +129,14 @@ const utils = module.exports = {
     testRunner.on('testfinished', test => {
       // Do not report tests from COVERAGE testsuite.
       // They don't bring much value to us.
-      if (test.fullName.includes(COVERAGE_TESTSUITE_NAME))
+      if (test.fullName.includes('**API COVERAGE**'))
         return;
       const testpath = test.location.filePath.substring(utils.projectRoot().length);
       const url = `https://github.com/Microsoft/playwright/blob/${sha}/${testpath}#L${test.location.lineNumber}`;
       dashboard.reportTestResult({
         testId: test.testId,
-        name: test.location.fileName + ':' + test.location.lineNumber,
-        description: test.fullName,
+        name: test.location().toString(),
+        description: test.fullName(),
         url,
         result: test.result,
       });
@@ -262,10 +156,45 @@ const utils = module.exports = {
         const testId = testIdComponents.join('>');
         const clashingTest = testIds.get(testId);
         if (clashingTest)
-          throw new Error(`Two tests with clashing IDs: ${test.location.fileName}:${test.location.lineNumber} and ${clashingTest.location.fileName}:${clashingTest.location.lineNumber}`);
+          throw new Error(`Two tests with clashing IDs: ${test.location()} and ${clashingTest.location()}`);
         testIds.set(testId, test);
         test.testId = testId;
       }
     }
   },
+
+  makeUserDataDir: async function() {
+    return await mkdtempAsync(path.join(os.tmpdir(), 'playwright_dev_profile-'));
+  },
+
+  removeUserDataDir: async function(dir) {
+    await removeFolderAsync(dir).catch(e => {});
+  },
+
+  testOptions(browserType) {
+    const GOLDEN_DIR = path.join(__dirname, 'golden-' + browserType.name());
+    const OUTPUT_DIR = path.join(__dirname, 'output-' + browserType.name());
+    return {
+      FFOX: browserType.name() === 'firefox',
+      WEBKIT: browserType.name() === 'webkit',
+      CHROMIUM: browserType.name() === 'chromium',
+      MAC: platform === 'darwin',
+      LINUX: platform === 'linux',
+      WIN: platform === 'win32',
+      browserType,
+      GOLDEN_DIR,
+      OUTPUT_DIR,
+    };
+  },
+
+  setPlatform(p) {
+    // To support isplaywrightready.
+    platform = p;
+  },
 };
+
+function valueFromEnv(name, defaultValue) {
+  if (!(name in process.env))
+    return defaultValue;
+  return JSON.parse(process.env[name]);
+}

@@ -14,52 +14,54 @@
  * limitations under the License.
  */
 
+import * as fs from 'fs';
+import * as mime from 'mime';
+import * as path from 'path';
+import * as util from 'util';
 import * as frames from './frames';
+import { assert, helper } from './helper';
+import { Injected, InjectedResult } from './injected/injected';
 import * as input from './input';
 import * as js from './javascript';
-import * as types from './types';
-import * as injectedSource from './generated/injectedSource';
-import * as zsSelectorEngineSource from './generated/zsSelectorEngineSource';
-import { assert, helper, debugError } from './helper';
-import Injected from './injected/injected';
 import { Page } from './page';
-import * as platform from './platform';
+import { selectors } from './selectors';
+import * as types from './types';
+import { NotConnectedError, TimeoutError } from './errors';
+import { Log, logError } from './logger';
+
+export type PointerActionOptions = {
+  modifiers?: input.Modifier[];
+  position?: types.Point;
+};
+
+export type ClickOptions = PointerActionOptions & input.MouseClickOptions;
+
+export type MultiClickOptions = PointerActionOptions & input.MouseMultiClickOptions;
+
+export const inputLog: Log = {
+  name: 'input',
+  color: 'cyan'
+};
 
 export class FrameExecutionContext extends js.ExecutionContext {
   readonly frame: frames.Frame;
-
   private _injectedPromise?: Promise<js.JSHandle>;
 
   constructor(delegate: js.ExecutionContextDelegate, frame: frames.Frame) {
-    super(delegate);
+    super(delegate, frame._page);
     this.frame = frame;
   }
 
-  async _evaluate(returnByValue: boolean, pageFunction: string | Function, ...args: any[]): Promise<any> {
-    const needsAdoption = (value: any): boolean => {
-      return typeof value === 'object' && value instanceof ElementHandle && value._context !== this;
-    };
+  _adoptIfNeeded(handle: js.JSHandle): Promise<js.JSHandle> | null {
+    if (handle instanceof ElementHandle && handle._context !== this)
+      return this.frame._page._delegate.adoptElementHandle(handle, this);
+    return null;
+  }
 
-    if (!args.some(needsAdoption)) {
-      // Only go through asynchronous calls if required.
+  async _doEvaluateInternal(returnByValue: boolean, waitForNavigations: boolean, pageFunction: string | Function, ...args: any[]): Promise<any> {
+    return await this.frame._page._frameManager.waitForSignalsCreatedBy(async () => {
       return this._delegate.evaluate(this, returnByValue, pageFunction, ...args);
-    }
-
-    const toDispose: Promise<ElementHandle>[] = [];
-    const adopted = await Promise.all(args.map(async arg => {
-      if (!needsAdoption(arg))
-        return arg;
-      const adopted = this.frame._page._delegate.adoptElementHandle(arg, this);
-      toDispose.push(adopted);
-      return adopted;
-    }));
-    let result;
-    try {
-      result = await this._delegate.evaluate(this, returnByValue, pageFunction, ...adopted);
-    } finally {
-      await Promise.all(toDispose.map(handlePromise => handlePromise.then(handle => handle.dispose())));
-    }
-    return result;
+    }, Number.MAX_SAFE_INTEGER, waitForNavigations ? undefined : { noWaitAfter: true });
   }
 
   _createHandle(remoteObject: any): js.JSHandle {
@@ -68,50 +70,13 @@ export class FrameExecutionContext extends js.ExecutionContext {
     return super._createHandle(remoteObject);
   }
 
-  _injected(): Promise<js.JSHandle> {
+  _injected(): Promise<js.JSHandle<Injected>> {
     if (!this._injectedPromise) {
-      const additionalEngineSources = [zsSelectorEngineSource.source];
-      const source = `
-        new (${injectedSource.source})([
-          ${additionalEngineSources.join(',\n')},
-        ])
-      `;
-      this._injectedPromise = this.evaluateHandle(source);
+      this._injectedPromise = selectors._prepareEvaluator(this).then(evaluator => {
+        return this.evaluateHandleInternal(evaluator => evaluator.injected, evaluator);
+      });
     }
     return this._injectedPromise;
-  }
-
-  async _$(selector: string, scope?: ElementHandle): Promise<ElementHandle<Element> | null> {
-    const handle = await this.evaluateHandle(
-        (injected: Injected, selector: string, scope?: Node) => injected.querySelector(selector, scope || document),
-        await this._injected(), normalizeSelector(selector), scope
-    );
-    if (!handle.asElement())
-      await handle.dispose();
-    return handle.asElement() as ElementHandle<Element>;
-  }
-
-  async _$array(selector: string, scope?: ElementHandle): Promise<js.JSHandle<Element[]>> {
-    const arrayHandle = await this.evaluateHandle(
-        (injected: Injected, selector: string, scope?: Node) => injected.querySelectorAll(selector, scope || document),
-        await this._injected(), normalizeSelector(selector), scope
-    );
-    return arrayHandle;
-  }
-
-  async _$$(selector: string, scope?: ElementHandle): Promise<ElementHandle<Element>[]> {
-    const arrayHandle = await this._$array(selector, scope);
-    const properties = await arrayHandle.getProperties();
-    await arrayHandle.dispose();
-    const result: ElementHandle<Element>[] = [];
-    for (const property of properties.values()) {
-      const elementHandle = property.asElement() as ElementHandle<Element>;
-      if (elementHandle)
-        result.push(elementHandle);
-      else
-        await property.dispose();
-    }
-    return result;
   }
 }
 
@@ -129,74 +94,80 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return this;
   }
 
-  _evaluateInUtility: types.EvaluateOn<T> = async (pageFunction, ...args) => {
+  async _evaluateInMain<R, Arg>(pageFunction: types.FuncOn<{ injected: Injected, node: T }, Arg, R>, arg: Arg): Promise<R> {
+    const main = await this._context.frame._mainContext();
+    return main._doEvaluateInternal(true /* returnByValue */, true /* waitForNavigations */, pageFunction, { injected: await main._injected(), node: this }, arg);
+  }
+
+  async _evaluateInUtility<R, Arg>(pageFunction: types.FuncOn<{ injected: Injected, node: T }, Arg, R>, arg: Arg): Promise<R> {
     const utility = await this._context.frame._utilityContext();
-    return utility.evaluate(pageFunction as any, this, ...args);
+    return utility._doEvaluateInternal(true /* returnByValue */, true /* waitForNavigations */, pageFunction, { injected: await utility._injected(), node: this }, arg);
   }
 
   async ownerFrame(): Promise<frames.Frame | null> {
-    return this._page._delegate.getOwnerFrame(this);
+    const frameId = await this._page._delegate.getOwnerFrame(this);
+    if (!frameId)
+      return null;
+    const frame = this._page._frameManager.frame(frameId);
+    if (frame)
+      return frame;
+    for (const page of this._page._browserContext.pages()) {
+      const frame = page._frameManager.frame(frameId);
+      if (frame)
+        return frame;
+    }
+    return null;
   }
 
   async contentFrame(): Promise<frames.Frame | null> {
-    const isFrameElement = await this._evaluateInUtility(node => node && (node instanceof HTMLIFrameElement || node instanceof HTMLFrameElement));
+    const isFrameElement = await this._evaluateInUtility(({node}) => node && (node.nodeName === 'IFRAME' || node.nodeName === 'FRAME'), {});
     if (!isFrameElement)
       return null;
     return this._page._delegate.getContentFrame(this);
   }
 
-  async scrollIntoViewIfNeeded() {
-    const error = await this._evaluateInUtility(async (node: Node, pageJavascriptEnabled: boolean) => {
-      if (!node.isConnected)
-        return 'Node is detached from document';
+  async getAttribute(name: string): Promise<string | null> {
+    return this._evaluateInUtility(({node}, name: string) => {
       if (node.nodeType !== Node.ELEMENT_NODE)
-        return 'Node is not of type HTMLElement';
-      const element = node as Element;
-      // force-scroll if page's javascript is disabled.
-      if (!pageJavascriptEnabled) {
-        // @ts-ignore because only Chromium still supports 'instant'
-        element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-        return false;
-      }
-      const visibleRatio = await new Promise(resolve => {
-        const observer = new IntersectionObserver(entries => {
-          resolve(entries[0].intersectionRatio);
-          observer.disconnect();
-        });
-        observer.observe(element);
-        // Firefox doesn't call IntersectionObserver callback unless
-        // there are rafs.
-        requestAnimationFrame(() => {});
-      });
-      if (visibleRatio !== 1.0) {
-        // @ts-ignore because only Chromium still supports 'instant'
-        element.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
-      }
-      return false;
-    }, !!this._page.browserContext()._options.javaScriptEnabled);
-    if (error)
-      throw new Error(error);
+        throw new Error('Not an element');
+      const element = node as unknown as Element;
+      return element.getAttribute(name);
+    }, name);
   }
 
-  private async _ensurePointerActionPoint(relativePoint?: types.Point): Promise<types.Point> {
-    await this.scrollIntoViewIfNeeded();
-    if (!relativePoint)
-      return this._clickablePoint();
-    let r = await this._viewportPointAndScroll(relativePoint);
-    if (r.scrollX || r.scrollY) {
-      const error = await this._evaluateInUtility((element, scrollX, scrollY) => {
-        if (!element.ownerDocument || !element.ownerDocument.defaultView)
-          return 'Node does not have a containing window';
-        element.ownerDocument.defaultView.scrollBy(scrollX, scrollY);
-        return false;
-      }, r.scrollX, r.scrollY);
-      if (error)
-        throw new Error(error);
-      r = await this._viewportPointAndScroll(relativePoint);
-      if (r.scrollX || r.scrollY)
-        throw new Error('Failed to scroll relative point into viewport');
-    }
-    return r.point;
+  async textContent(): Promise<string | null> {
+    return this._evaluateInUtility(({node}) => node.textContent, {});
+  }
+
+  async innerText(): Promise<string | null> {
+    return this._evaluateInUtility(({node}) => {
+      if (node.nodeType !== Node.ELEMENT_NODE)
+        throw new Error('Not an element');
+      const element = node as unknown as HTMLElement;
+      return element.innerText;
+    }, {});
+  }
+
+  async innerHTML(): Promise<string | null> {
+    return this._evaluateInUtility(({node}) => {
+      if (node.nodeType !== Node.ELEMENT_NODE)
+        throw new Error('Not an element');
+      const element = node as unknown as Element;
+      return element.innerHTML;
+    }, {});
+  }
+
+  async dispatchEvent(type: string, eventInit: Object = {}) {
+    await this._evaluateInMain(({ injected, node }, { type, eventInit }) =>
+      injected.dispatchEvent(node, type, eventInit), { type, eventInit });
+  }
+
+  async _scrollRectIntoViewIfNeeded(rect?: types.Rect): Promise<void> {
+    await this._page._delegate.scrollRectIntoViewIfNeeded(this, rect);
+  }
+
+  async scrollIntoViewIfNeeded() {
+    await this._scrollRectIntoViewIfNeeded();
   }
 
   private async _clickablePoint(): Promise<types.Point> {
@@ -222,7 +193,7 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     const [quads, metrics] = await Promise.all([
       this._page._delegate.getContentQuads(this),
       this._page._delegate.layoutViewport(),
-    ]);
+    ] as const);
     if (!quads || !quads.length)
       throw new Error('Node is either not visible or not an HTMLElement');
 
@@ -238,70 +209,107 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
     return result;
   }
 
-  private async _viewportPointAndScroll(relativePoint: types.Point): Promise<{point: types.Point, scrollX: number, scrollY: number}> {
+  private async _offsetPoint(offset: types.Point): Promise<types.Point> {
     const [box, border] = await Promise.all([
       this.boundingBox(),
-      this._evaluateInUtility((node: Node) => {
-        if (node.nodeType !== Node.ELEMENT_NODE || !node.ownerDocument || !node.ownerDocument.defaultView)
-          return { x: 0, y: 0 };
-        const style = node.ownerDocument.defaultView.getComputedStyle(node as Element);
-        return { x: parseInt(style.borderLeftWidth || '', 10), y: parseInt(style.borderTopWidth || '', 10) };
-      }).catch(debugError),
+      this._evaluateInUtility(({ injected, node }) => injected.getElementBorderWidth(node), {}).catch(logError(this._context._logger)),
     ]);
-    const point = { x: relativePoint.x, y: relativePoint.y };
+    const point = { x: offset.x, y: offset.y };
     if (box) {
       point.x += box.x;
       point.y += box.y;
     }
     if (border) {
       // Make point relative to the padding box to align with offsetX/offsetY.
-      point.x += border.x;
-      point.y += border.y;
+      point.x += border.left;
+      point.y += border.top;
     }
-    const metrics = await this._page._delegate.layoutViewport();
-    // Give 20 extra pixels to avoid any issues on viewport edge.
-    let scrollX = 0;
-    if (point.x < 20)
-      scrollX = point.x - 20;
-    if (point.x > metrics.width - 20)
-      scrollX = point.x - metrics.width + 20;
-    let scrollY = 0;
-    if (point.y < 20)
-      scrollY = point.y - 20;
-    if (point.y > metrics.height - 20)
-      scrollY = point.y - metrics.height + 20;
-    return { point, scrollX, scrollY };
+    return point;
   }
 
-  async _performPointerAction(action: (point: types.Point) => Promise<void>, options?: input.PointerActionOptions): Promise<void> {
-    const point = await this._ensurePointerActionPoint(options ? options.relativePoint : undefined);
-    let restoreModifiers: input.Modifier[] | undefined;
-    if (options && options.modifiers)
-      restoreModifiers = await this._page.keyboard._ensureModifiers(options.modifiers);
-    await action(point);
-    if (restoreModifiers)
-      await this._page.keyboard._ensureModifiers(restoreModifiers);
+  async _retryPointerAction(action: (point: types.Point) => Promise<void>, options: PointerActionOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<void> {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    while (!helper.isPastDeadline(deadline)) {
+      const result = await this._performPointerAction(action, deadline, options);
+      if (result === 'done')
+        return;
+    }
+    throw new TimeoutError(`waiting for element to receive pointer events failed: timeout exceeded`);
   }
 
-  hover(options?: input.PointerActionOptions): Promise<void> {
-    return this._performPointerAction(point => this._page.mouse.move(point.x, point.y), options);
+  async _performPointerAction(action: (point: types.Point) => Promise<void>, deadline: number, options: PointerActionOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions = {}): Promise<'done' | 'retry'> {
+    const { force = false, position } = options;
+    if (!force)
+      await this._waitForDisplayedAtStablePosition(deadline);
+
+    let paused = false;
+    try {
+      await this._page._delegate.setActivityPaused(true);
+      paused = true;
+
+      // Scroll into view and calculate the point again while paused just in case something has moved.
+      this._page._log(inputLog, 'scrolling into view if needed...');
+      await this._scrollRectIntoViewIfNeeded(position ? { x: position.x, y: position.y, width: 0, height: 0 } : undefined);
+      this._page._log(inputLog, '...done scrolling');
+      const point = roundPoint(position ? await this._offsetPoint(position) : await this._clickablePoint());
+
+      if (!force) {
+        if ((options as any).__testHookBeforeHitTarget)
+          await (options as any).__testHookBeforeHitTarget();
+        this._page._log(inputLog, `checking that element receives pointer events at (${point.x},${point.y})...`);
+        const matchesHitTarget = await this._checkHitTargetAt(point);
+        if (!matchesHitTarget) {
+          this._page._log(inputLog, '...element does not receive pointer events, retrying input action');
+          await this._page._delegate.setActivityPaused(false);
+          paused = false;
+          return 'retry';
+        }
+        this._page._log(inputLog, `...element does receive pointer events, continuing input action`);
+      }
+
+      await this._page._frameManager.waitForSignalsCreatedBy(async () => {
+        let restoreModifiers: input.Modifier[] | undefined;
+        if (options && options.modifiers)
+          restoreModifiers = await this._page.keyboard._ensureModifiers(options.modifiers);
+        this._page._log(inputLog, 'performing input action...');
+        await action(point);
+        this._page._log(inputLog, '...input action done');
+        this._page._log(inputLog, 'waiting for navigations to finish...');
+        await this._page._delegate.setActivityPaused(false);
+        paused = false;
+        if (restoreModifiers)
+          await this._page.keyboard._ensureModifiers(restoreModifiers);
+      }, deadline, options, true);
+      this._page._log(inputLog, '...navigations have finished');
+
+      return 'done';
+    } finally {
+      if (paused)
+        await this._page._delegate.setActivityPaused(false);
+    }
   }
 
-  click(options?: input.ClickOptions): Promise<void> {
-    return this._performPointerAction(point => this._page.mouse.click(point.x, point.y, options), options);
+  hover(options?: PointerActionOptions & types.PointerActionWaitOptions): Promise<void> {
+    return this._retryPointerAction(point => this._page.mouse.move(point.x, point.y), options);
   }
 
-  dblclick(options?: input.MultiClickOptions): Promise<void> {
-    return this._performPointerAction(point => this._page.mouse.dblclick(point.x, point.y, options), options);
+  click(options?: ClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<void> {
+    return this._retryPointerAction(point => this._page.mouse.click(point.x, point.y, options), options);
   }
 
-  tripleclick(options?: input.MultiClickOptions): Promise<void> {
-    return this._performPointerAction(point => this._page.mouse.tripleclick(point.x, point.y, options), options);
+  dblclick(options?: MultiClickOptions & types.PointerActionWaitOptions & types.NavigatingActionWaitOptions): Promise<void> {
+    return this._retryPointerAction(point => this._page.mouse.dblclick(point.x, point.y, options), options);
   }
 
-  async select(...values: (string | ElementHandle | types.SelectOption)[]): Promise<string[]> {
-    const options = values.map(value => typeof value === 'object' ? value : { value });
-    for (const option of options) {
+  async selectOption(values: string | ElementHandle | types.SelectOption | string[] | ElementHandle[] | types.SelectOption[], options?: types.NavigatingActionWaitOptions): Promise<string[]> {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    let vals: string[] | ElementHandle[] | types.SelectOption[];
+    if (!Array.isArray(values))
+      vals = [ values ] as (string[] | ElementHandle[] | types.SelectOption[]);
+    else
+      vals = values;
+    const selectOptions = (vals as any).map((value: any) => typeof value === 'object' ? value : { value });
+    for (const option of selectOptions) {
       if (option instanceof ElementHandle)
         continue;
       if (option.value !== undefined)
@@ -311,255 +319,189 @@ export class ElementHandle<T extends Node = Node> extends js.JSHandle<T> {
       if (option.index !== undefined)
         assert(helper.isNumber(option.index), 'Indices must be numbers. Found index "' + option.index + '" of type "' + (typeof option.index) + '"');
     }
-    return this._evaluateInUtility((node: Node, ...optionsToSelect: (Node | types.SelectOption)[]) => {
-      if (node.nodeName.toLowerCase() !== 'select')
-        throw new Error('Element is not a <select> element.');
-      const element = node as HTMLSelectElement;
-
-      const options = Array.from(element.options);
-      element.value = undefined as any;
-      for (let index = 0; index < options.length; index++) {
-        const option = options[index];
-        option.selected = optionsToSelect.some(optionToSelect => {
-          if (optionToSelect instanceof Node)
-            return option === optionToSelect;
-          let matches = true;
-          if (optionToSelect.value !== undefined)
-            matches = matches && optionToSelect.value === option.value;
-          if (optionToSelect.label !== undefined)
-            matches = matches && optionToSelect.label === option.label;
-          if (optionToSelect.index !== undefined)
-            matches = matches && optionToSelect.index === index;
-          return matches;
-        });
-        if (option.selected && !element.multiple)
-          break;
-      }
-      element.dispatchEvent(new Event('input', { 'bubbles': true }));
-      element.dispatchEvent(new Event('change', { 'bubbles': true }));
-      return options.filter(option => option.selected).map(option => option.value);
-    }, ...options);
+    return await this._page._frameManager.waitForSignalsCreatedBy<string[]>(async () => {
+      const injectedResult = await this._evaluateInUtility(({ injected, node }, selectOptions) => injected.selectOptions(node, selectOptions), selectOptions);
+      return handleInjectedResult(injectedResult, '');
+    }, deadline, options);
   }
 
-  async fill(value: string): Promise<void> {
+  async fill(value: string, options?: types.NavigatingActionWaitOptions): Promise<void> {
     assert(helper.isString(value), 'Value must be string. Found value "' + value + '" of type "' + (typeof value) + '"');
-    const error = await this._evaluateInUtility((node: Node) => {
-      if (node.nodeType !== Node.ELEMENT_NODE)
-        return 'Node is not of type HTMLElement';
-      const element = node as HTMLElement;
-      if (!element.isConnected)
-        return 'Element is not attached to the DOM';
-      if (!element.ownerDocument || !element.ownerDocument.defaultView)
-        return 'Element does not belong to a window';
-
-      const style = element.ownerDocument.defaultView.getComputedStyle(element);
-      if (!style || style.visibility === 'hidden')
-        return 'Element is hidden';
-      if (!element.offsetParent && element.tagName !== 'BODY')
-        return 'Element is not visible';
-      if (element.nodeName.toLowerCase() === 'input') {
-        const input = element as HTMLInputElement;
-        const type = input.getAttribute('type') || '';
-        const kTextInputTypes = new Set(['', 'email', 'password', 'search', 'tel', 'text', 'url']);
-        if (!kTextInputTypes.has(type.toLowerCase()))
-          return 'Cannot fill input of type "' + type + '".';
-        if (input.disabled)
-          return 'Cannot fill a disabled input.';
-        if (input.readOnly)
-          return 'Cannot fill a readonly input.';
-        input.select();
-        input.focus();
-      } else if (element.nodeName.toLowerCase() === 'textarea') {
-        const textarea = element as HTMLTextAreaElement;
-        if (textarea.disabled)
-          return 'Cannot fill a disabled textarea.';
-        if (textarea.readOnly)
-          return 'Cannot fill a readonly textarea.';
-        textarea.selectionStart = 0;
-        textarea.selectionEnd = textarea.value.length;
-        textarea.focus();
-      } else if (element.isContentEditable) {
-        const range = element.ownerDocument.createRange();
-        range.selectNodeContents(element);
-        const selection = element.ownerDocument.defaultView.getSelection();
-        if (!selection)
-          return 'Element belongs to invisible iframe.';
-        selection.removeAllRanges();
-        selection.addRange(range);
-        element.focus();
-      } else {
-        return 'Element is not an <input>, <textarea> or [contenteditable] element.';
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    await this._page._frameManager.waitForSignalsCreatedBy(async () => {
+      const injectedResult = await this._evaluateInUtility(({ injected, node }, value) => injected.fill(node, value), value);
+      const needsInput = handleInjectedResult(injectedResult, '');
+      if (needsInput) {
+        if (value)
+          await this._page.keyboard.insertText(value);
+        else
+          await this._page.keyboard.press('Delete');
       }
-      return false;
-    });
-    if (error)
-      throw new Error(error);
-    await this._page.keyboard.sendCharacters(value);
+    }, deadline, options, true);
   }
 
-  async setInputFiles(...files: (string | types.FilePayload)[]) {
-    const multiple = await this._evaluateInUtility((node: Node) => {
-      if (node.nodeType !== Node.ELEMENT_NODE || (node as Element).tagName !== 'INPUT')
-        throw new Error('Node is not an HTMLInputElement');
-      const input = node as HTMLInputElement;
-      return input.multiple;
-    });
-    assert(multiple || files.length <= 1, 'Non-multiple file input can only accept single file!');
-    const filePayloads = await Promise.all(files.map(async item => {
+  async selectText(): Promise<void> {
+    const injectedResult = await this._evaluateInUtility(({ injected, node }) => injected.selectText(node), {});
+    handleInjectedResult(injectedResult, '');
+  }
+
+  async setInputFiles(files: string | types.FilePayload | string[] | types.FilePayload[], options?: types.NavigatingActionWaitOptions) {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    const injectedResult = await this._evaluateInUtility(({ node }): InjectedResult<boolean> => {
+      if (node.nodeType !== Node.ELEMENT_NODE || (node as Node as Element).tagName !== 'INPUT')
+        return { status: 'error', error: 'Node is not an HTMLInputElement' };
+      if (!node.isConnected)
+        return { status: 'notconnected' };
+      const input = node as Node as HTMLInputElement;
+      return { status: 'success', value: input.multiple };
+    }, {});
+    const multiple = handleInjectedResult(injectedResult, '');
+    let ff: string[] | types.FilePayload[];
+    if (!Array.isArray(files))
+      ff = [ files ] as string[] | types.FilePayload[];
+    else
+      ff = files;
+    assert(multiple || ff.length <= 1, 'Non-multiple file input can only accept single file!');
+    const filePayloads: types.FilePayload[] = [];
+    for (const item of ff) {
       if (typeof item === 'string') {
         const file: types.FilePayload = {
-          name: platform.basename(item),
-          type: 'application/octet-stream',
-          data: await platform.readFileAsync(item, 'base64')
+          name: path.basename(item),
+          mimeType: mime.getType(item) || 'application/octet-stream',
+          buffer: await util.promisify(fs.readFile)(item)
         };
-        return file;
+        filePayloads.push(file);
+      } else {
+        filePayloads.push(item);
       }
-      return item;
-    }));
-    await this._page._delegate.setInputFiles(this as any as ElementHandle<HTMLInputElement>, filePayloads);
+    }
+    await this._page._frameManager.waitForSignalsCreatedBy(async () => {
+      await this._page._delegate.setInputFiles(this as any as ElementHandle<HTMLInputElement>, filePayloads);
+    }, deadline, options);
   }
 
   async focus() {
-    const errorMessage = await this._evaluateInUtility((element: Node) => {
-      if (!(element as any)['focus'])
-        return 'Node is not an HTML or SVG element.';
-      (element as HTMLElement|SVGElement).focus();
-      return false;
-    });
-    if (errorMessage)
-      throw new Error(errorMessage);
+    const injectedResult = await this._evaluateInUtility(({ injected, node }) => injected.focusNode(node), {});
+    handleInjectedResult(injectedResult, '');
   }
 
-  async type(text: string, options?: { delay?: number }) {
-    await this.focus();
-    await this._page.keyboard.type(text, options);
+  async type(text: string, options?: { delay?: number } & types.NavigatingActionWaitOptions) {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    await this._page._frameManager.waitForSignalsCreatedBy(async () => {
+      await this.focus();
+      await this._page.keyboard.type(text, options);
+    }, deadline, options, true);
   }
 
-  async press(key: string, options: { delay?: number; text?: string; } | undefined) {
-    await this.focus();
-    await this._page.keyboard.press(key, options);
+  async press(key: string, options?: { delay?: number } & types.NavigatingActionWaitOptions) {
+    const deadline = this._page._timeoutSettings.computeDeadline(options);
+    await this._page._frameManager.waitForSignalsCreatedBy(async () => {
+      await this.focus();
+      await this._page.keyboard.press(key, options);
+    }, deadline, options, true);
+  }
+
+  async check(options?: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+    await this._setChecked(true, options);
+  }
+
+  async uncheck(options?: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+    await this._setChecked(false, options);
+  }
+
+  private async _setChecked(state: boolean, options?: types.PointerActionWaitOptions & types.NavigatingActionWaitOptions) {
+    if (await this._evaluateInUtility(({ injected, node }) => injected.isCheckboxChecked(node), {}) === state)
+      return;
+    await this.click(options);
+    if (await this._evaluateInUtility(({ injected, node }) => injected.isCheckboxChecked(node), {}) !== state)
+      throw new Error('Unable to click checkbox');
   }
 
   async boundingBox(): Promise<types.Rect | null> {
     return this._page._delegate.getBoundingBox(this);
   }
 
-  async screenshot(options?: types.ElementScreenshotOptions): Promise<string | platform.BufferType> {
+  async screenshot(options?: types.ElementScreenshotOptions): Promise<Buffer> {
     return this._page._screenshotter.screenshotElement(this, options);
   }
 
-  $(selector: string): Promise<ElementHandle | null> {
-    return this._context._$(selector, this);
+  async $(selector: string): Promise<ElementHandle | null> {
+    return selectors._query(this._context.frame, selector, this);
   }
 
-  $$(selector: string): Promise<ElementHandle<Element>[]> {
-    return this._context._$$(selector, this);
+  async $$(selector: string): Promise<ElementHandle<Element>[]> {
+    return selectors._queryAll(this._context.frame, selector, this);
   }
 
-  $eval: types.$Eval = async (selector, pageFunction, ...args) => {
-    const elementHandle = await this._context._$(selector, this);
-    if (!elementHandle)
+  async $eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element, Arg, R>, arg: Arg): Promise<R>;
+  async $eval<R>(selector: string, pageFunction: types.FuncOn<Element, void, R>, arg?: any): Promise<R>;
+  async $eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element, Arg, R>, arg: Arg): Promise<R> {
+    const handle = await selectors._query(this._context.frame, selector, this);
+    if (!handle)
       throw new Error(`Error: failed to find element matching selector "${selector}"`);
-    const result = await elementHandle.evaluate(pageFunction, ...args as any);
-    await elementHandle.dispose();
+    const result = await handle.evaluate(pageFunction, arg);
+    handle.dispose();
     return result;
   }
 
-  $$eval: types.$$Eval = async (selector, pageFunction, ...args) => {
-    const arrayHandle = await this._context._$array(selector, this);
-    const result = await arrayHandle.evaluate(pageFunction, ...args as any);
-    await arrayHandle.dispose();
+  async $$eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element[], Arg, R>, arg: Arg): Promise<R>;
+  async $$eval<R>(selector: string, pageFunction: types.FuncOn<Element[], void, R>, arg?: any): Promise<R>;
+  async $$eval<R, Arg>(selector: string, pageFunction: types.FuncOn<Element[], Arg, R>, arg: Arg): Promise<R> {
+    const arrayHandle = await selectors._queryArray(this._context.frame, selector, this);
+    const result = await arrayHandle.evaluate(pageFunction, arg);
+    arrayHandle.dispose();
     return result;
   }
 
-  visibleRatio(): Promise<number> {
-    return this._evaluateInUtility(async (node: Node) => {
-      if (node.nodeType !== Node.ELEMENT_NODE)
-        throw new Error('Node is not of type HTMLElement');
-      const element = node as Element;
-      const visibleRatio = await new Promise<number>(resolve => {
-        const observer = new IntersectionObserver(entries => {
-          resolve(entries[0].intersectionRatio);
-          observer.disconnect();
-        });
-        observer.observe(element);
-        // Firefox doesn't call IntersectionObserver callback unless
-        // there are rafs.
-        requestAnimationFrame(() => {});
-      });
-      return visibleRatio;
-    });
+  async _waitForDisplayedAtStablePosition(deadline: number): Promise<void> {
+    this._page._log(inputLog, 'waiting for element to be displayed and not moving...');
+    const stablePromise = this._evaluateInUtility(({ injected, node }, timeout) => {
+      return injected.waitForDisplayedAtStablePosition(node, timeout);
+    }, helper.timeUntilDeadline(deadline));
+    const timeoutMessage = 'element to be displayed and not moving';
+    const injectedResult = await helper.waitWithDeadline(stablePromise, timeoutMessage, deadline);
+    handleInjectedResult(injectedResult, timeoutMessage);
+    this._page._log(inputLog, '...element is displayed and does not move');
   }
-}
 
-function normalizeSelector(selector: string): string {
-  const eqIndex = selector.indexOf('=');
-  if (eqIndex !== -1 && selector.substring(0, eqIndex).trim().match(/^[a-zA-Z_0-9-]+$/))
-    return selector;
-  if (selector.startsWith('//'))
-    return 'xpath=' + selector;
-  if (selector.startsWith('"'))
-    return 'text=' + selector;
-  return 'css=' + selector;
-}
-
-export type Task = (context: FrameExecutionContext) => Promise<js.JSHandle>;
-
-export function waitForFunctionTask(selector: string | undefined, pageFunction: Function | string, options: types.WaitForFunctionOptions, ...args: any[]) {
-  const { polling = 'raf' } = options;
-  if (helper.isString(polling))
-    assert(polling === 'raf' || polling === 'mutation', 'Unknown polling option: ' + polling);
-  else if (helper.isNumber(polling))
-    assert(polling > 0, 'Cannot poll with non-positive interval: ' + polling);
-  else
-    throw new Error('Unknown polling options: ' + polling);
-  const predicateBody = helper.isString(pageFunction) ? 'return (' + pageFunction + ')' : 'return (' + pageFunction + ')(...args)';
-  if (selector !== undefined)
-    selector = normalizeSelector(selector);
-
-  return async (context: FrameExecutionContext) => context.evaluateHandle((injected: Injected, selector: string | undefined, predicateBody: string, polling: types.Polling, timeout: number, ...args) => {
-    const innerPredicate = new Function('...args', predicateBody);
-    if (polling === 'raf')
-      return injected.pollRaf(selector, predicate, timeout);
-    if (polling === 'mutation')
-      return injected.pollMutation(selector, predicate, timeout);
-    return injected.pollInterval(selector, polling, predicate, timeout);
-
-    function predicate(element: Element | undefined): any {
-      if (selector === undefined)
-        return innerPredicate(...args);
-      return innerPredicate(element, ...args);
+  async _checkHitTargetAt(point: types.Point): Promise<boolean> {
+    const frame = await this.ownerFrame();
+    if (frame && frame.parentFrame()) {
+      const element = await frame.frameElement();
+      const box = await element.boundingBox();
+      if (!box)
+        throw new NotConnectedError();
+      // Translate from viewport coordinates to frame coordinates.
+      point = { x: point.x - box.x, y: point.y - box.y };
     }
-  }, await context._injected(), selector, predicateBody, polling, options.timeout || 0, ...args);
+    const injectedResult = await this._evaluateInUtility(({ injected, node }, { point }) => {
+      return injected.checkHitTargetAt(node, point);
+    }, { point });
+    return handleInjectedResult(injectedResult, '');
+  }
 }
 
-export function waitForSelectorTask(selector: string, visibility: types.Visibility, timeout: number): Task {
-  return async (context: FrameExecutionContext) => {
-    selector = normalizeSelector(selector);
-    return context.evaluateHandle((injected: Injected, selector: string, visibility: types.Visibility, timeout: number) => {
-      if (visibility !== 'any')
-        return injected.pollRaf(selector, predicate, timeout);
-      return injected.pollMutation(selector, predicate, timeout);
+export function toFileTransferPayload(files: types.FilePayload[]): types.FileTransferPayload[] {
+  return files.map(file => ({
+    name: file.name,
+    type: file.mimeType,
+    data: file.buffer.toString('base64')
+  }));
+}
 
-      function predicate(element: Element | undefined): Element | boolean {
-        if (!element)
-          return visibility === 'hidden';
-        if (visibility === 'any')
-          return element;
-        return injected.isVisible(element) === (visibility === 'visible') ? element : false;
-      }
-    }, await context._injected(), selector, visibility, timeout);
+function handleInjectedResult<T = undefined>(injectedResult: InjectedResult<T>, timeoutMessage: string): T {
+  if (injectedResult.status === 'notconnected')
+    throw new NotConnectedError();
+  if (injectedResult.status === 'timeout')
+    throw new TimeoutError(`waiting for ${timeoutMessage} failed: timeout exceeded`);
+  if (injectedResult.status === 'error')
+    throw new Error(injectedResult.error);
+  return injectedResult.value as T;
+}
+
+function roundPoint(point: types.Point): types.Point {
+  return {
+    x: (point.x * 100 | 0) / 100,
+    y: (point.y * 100 | 0) / 100,
   };
 }
-
-export const setFileInputFunction = async (element: HTMLInputElement, payloads: types.FilePayload[]) => {
-  const files = await Promise.all(payloads.map(async (file: types.FilePayload) => {
-    const result = await fetch(`data:${file.type};base64,${file.data}`);
-    return new File([await result.blob()], file.name);
-  }));
-  const dt = new DataTransfer();
-  for (const file of files)
-    dt.items.add(file);
-  element.files = dt.files;
-  element.dispatchEvent(new Event('input', { 'bubbles': true }));
-};

@@ -55,13 +55,11 @@ Install [azure-cli](https://docs.microsoft.com/en-us/cli/azure/install-azure-cli
 
 ### 2. Export "az" to the mingw world
 
-Run `cmd` as administrator and run the following line:
+The easiest away to export "az" to mingw is to create `c:\mozilla-build\bin\az` with the following content:
 
 ```
-> echo cmd.exe /c "\"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd\" $1 $2 $3 $4 $5 $6 $7 $8 $9 ${10} ${11} ${12} ${13} ${14} ${15} ${16}" > "%SYSTEMROOT%\az"
+cmd.exe /c "\"C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.cmd\" $1 $2 $3 $4 $5 $6 $7 $8 $9 ${10} ${11} ${12} ${13} ${14} ${15} ${16}"
 ```
-
-This command will create a `c:\Windows\az` file that will call azure-cli with passed parameters (Not the most beautiful solution, but it works!)
 
 ### 3. Install node.js 
 
@@ -79,6 +77,8 @@ SET TELEGRAM_BOT_KEY=<bot_key>
 SET WEBKIT_BUILD_PATH=<value of "PATH" variable from cmd.exe>
 SET DEVENV="C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\Common7\IDE\devenv.com"
 ```
+> **NOTE:** mind different quotes position in DEVENV="..." than in PATH (and WEBKIT_BUILD_PATH). This is important.
+
 And right before the `REM Start shell.`, change `PATH` to export locally-installed node.js:
 ```bat
 SET "PATH=C:\Program Files\nodejs\;%PATH%"
@@ -101,15 +101,16 @@ The `core.longpaths` is needed for webkit since it has some very long layout pat
 
 > **NOTE:** If git config fails, run shell as administrator!
 
-### 6. Checkout PlayWright to /c/
+### 6. Checkout Playwright to /c/
 
-Run `c:\mozilla-build\start-shell.bat` and checkout PlayWright repo to `/c/playwright`.
+Run `c:\mozilla-build\start-shell.bat` and checkout Playwright repo to `/c/playwright`.
 
 ### 7. Create a c:\WEBKIT_WIN64_LIBS\ directory with win64 dlls
 
 
 Create a new `c:\WEBKIT_WIN64_LIBS` folder and copy the following libraries from `C:\Windows\System32` into it:
 - `msvcp140.dll`
+- `msvcp140_2.dll`
 - `vcruntime140.dll`
 - `vcruntime140_1.dll`
 
@@ -227,6 +228,8 @@ $ sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-9 100
 > **NOTE**: Firefox build config can be checked official Firefox builds, navigating to `about:buildconfig` URL. 
 
 ## Setting Bot Environment
+
+WebKit on Linux requires a new version of BubbleWrap. Download from https://launchpad.net/ubuntu/+source/bubblewrap/0.3.1-1ubuntu1 and install manually.
 
 > TODO: instructions to set up linux bot
 

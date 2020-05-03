@@ -3,15 +3,12 @@
 /test/output-firefox
 /test/output-webkit
 /test/test-user-data-dir*
-/.local-chromium/
-/.local-firefox/
-/.local-webkit/
+.local-browsers/
 /.dev_profile*
 .DS_Store
 *.swp
 *.pyc
 .vscode
-package-lock.json
 yarn.lock
 /node6
 /src/generated/*
@@ -20,5 +17,4 @@ yarn.lock
 /src/webkit/protocol.ts
 lib/
 playwright-*.tgz
-/web.js
-/web.js.map
+/types/*

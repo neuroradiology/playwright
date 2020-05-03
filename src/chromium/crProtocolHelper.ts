@@ -15,10 +15,11 @@
  * limitations under the License.
  */
 
-import { assert, debugError } from '../helper';
+import { assert } from '../helper';
 import { CRSession } from './crConnection';
 import { Protocol } from './protocol';
-import * as platform from '../platform';
+import * as fs from 'fs';
+import * as util from 'util';
 
 export function getExceptionMessage(exceptionDetails: Protocol.Runtime.ExceptionDetails): string {
   if (exceptionDetails.exception)
@@ -58,36 +59,27 @@ export function valueFromRemoteObject(remoteObject: Protocol.Runtime.RemoteObjec
 export async function releaseObject(client: CRSession, remoteObject: Protocol.Runtime.RemoteObject) {
   if (!remoteObject.objectId)
     return;
-  await client.send('Runtime.releaseObject', {objectId: remoteObject.objectId}).catch(error => {
-    // Exceptions might happen in case of a page been navigated or closed.
-    // Swallow these since they are harmless and we don't leak anything in this case.
-    debugError(error);
-  });
+  await client.send('Runtime.releaseObject', {objectId: remoteObject.objectId}).catch(error => {});
 }
 
-export async function readProtocolStream(client: CRSession, handle: string, path: string | null): Promise<platform.BufferType> {
+export async function readProtocolStream(client: CRSession, handle: string, path: string | null): Promise<Buffer> {
   let eof = false;
   let fd: number | undefined;
   if (path)
-    fd = await platform.openFdAsync(path, 'w');
+    fd = await util.promisify(fs.open)(path, 'w');
   const bufs = [];
   while (!eof) {
     const response = await client.send('IO.read', {handle});
     eof = response.eof;
-    const buf = platform.Buffer.from(response.data, response.base64Encoded ? 'base64' : undefined);
+    const buf = Buffer.from(response.data, response.base64Encoded ? 'base64' : undefined);
     bufs.push(buf);
     if (path)
-      await platform.writeFdAsync(fd!, buf);
+      await util.promisify(fs.write)(fd!, buf);
   }
   if (path)
-    await platform.closeFdAsync(fd!);
+    await util.promisify(fs.close)(fd!);
   await client.send('IO.close', {handle});
-  let resultBuffer = null;
-  try {
-    resultBuffer = platform.Buffer.concat(bufs);
-  } finally {
-    return resultBuffer!;
-  }
+  return Buffer.concat(bufs);
 }
 
 export function toConsoleMessageLocation(stackTrace: Protocol.Runtime.StackTrace | undefined) {
@@ -99,8 +91,21 @@ export function toConsoleMessageLocation(stackTrace: Protocol.Runtime.StackTrace
 }
 
 export function exceptionToError(exceptionDetails: Protocol.Runtime.ExceptionDetails): Error {
-  const message = getExceptionMessage(exceptionDetails);
+  const messageWithStack = getExceptionMessage(exceptionDetails);
+  const lines = messageWithStack.split('\n');
+  const firstStackTraceLine = lines.findIndex(line => line.startsWith('    at'));
+  let message = '';
+  let stack = '';
+  if (firstStackTraceLine === -1) {
+    message = messageWithStack;
+  } else {
+    message = lines.slice(0, firstStackTraceLine).join('\n');
+    stack = messageWithStack;
+  }
+  const match = message.match(/^[a-zA-Z0-0_]*Error: (.*)$/);
+  if (match)
+    message = match[1];
   const err = new Error(message);
-  err.stack = ''; // Don't report clientside error with a node stack attached
+  err.stack = stack;
   return err;
 }

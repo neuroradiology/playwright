@@ -15,14 +15,75 @@
  */
 
 import { BrowserContext, BrowserContextOptions } from './browserContext';
-import * as platform from './platform';
+import { Page } from './page';
+import { EventEmitter } from 'events';
+import { Download } from './download';
+import type { BrowserServer } from './server/browserServer';
+import { Events } from './events';
+import { InnerLogger, Log } from './logger';
 
-export interface Browser extends platform.EventEmitterType {
+export interface Browser extends EventEmitter {
   newContext(options?: BrowserContextOptions): Promise<BrowserContext>;
-  browserContexts(): BrowserContext[];
-  defaultContext(): BrowserContext;
-
-  disconnect(): Promise<void>;
+  contexts(): BrowserContext[];
+  newPage(options?: BrowserContextOptions): Promise<Page>;
   isConnected(): boolean;
   close(): Promise<void>;
 }
+
+export abstract class BrowserBase extends EventEmitter implements Browser, InnerLogger {
+  _downloadsPath: string = '';
+  private _downloads = new Map<string, Download>();
+  _ownedServer: BrowserServer | null = null;
+  readonly _logger: InnerLogger;
+
+  constructor(logger: InnerLogger) {
+    super();
+    this._logger = logger;
+  }
+
+  abstract newContext(options?: BrowserContextOptions): Promise<BrowserContext>;
+  abstract contexts(): BrowserContext[];
+  abstract isConnected(): boolean;
+  abstract _disconnect(): void;
+
+  async newPage(options?: BrowserContextOptions): Promise<Page> {
+    const context = await this.newContext(options);
+    const page = await context.newPage();
+    page._ownedContext = context;
+    return page;
+  }
+
+  _downloadCreated(page: Page, uuid: string, url: string) {
+    const download = new Download(page, this._downloadsPath, uuid, url);
+    this._downloads.set(uuid, download);
+  }
+
+  _downloadFinished(uuid: string, error?: string) {
+    const download = this._downloads.get(uuid);
+    if (!download)
+      return;
+    download._reportFinished(error);
+    this._downloads.delete(uuid);
+  }
+
+  async close() {
+    if (this._ownedServer) {
+      await this._ownedServer.close();
+    } else {
+      await Promise.all(this.contexts().map(context => context.close()));
+      this._disconnect();
+    }
+    if (this.isConnected())
+      await new Promise(x => this.once(Events.Browser.Disconnected, x));
+  }
+
+  _isLogEnabled(log: Log): boolean {
+    return this._logger._isLogEnabled(log);
+  }
+
+  _log(log: Log, message: string | Error, ...args: any[]) {
+    return this._logger._log(log, message, ...args);
+  }
+}
+
+export type LaunchType = 'local' | 'server' | 'persistent';

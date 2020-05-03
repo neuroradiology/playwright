@@ -15,10 +15,43 @@
  */
 
 import * as types from '../types';
+import * as api from '../api';
+import { helper } from '../helper';
 import { TimeoutError } from '../errors';
+import { DeviceDescriptors } from '../deviceDescriptors';
+import { Chromium } from './chromium';
+import { WebKit } from './webkit';
+import { Firefox } from './firefox';
+import { selectors } from '../selectors';
+import * as browserPaths from '../install/browserPaths';
 
-export interface Playwright {
-  executablePath(): string;
-  devices: types.Devices;
-  errors: { TimeoutError: typeof TimeoutError };
+for (const className in api) {
+  if (typeof (api as any)[className] === 'function')
+    helper.installApiHooks(className[0].toLowerCase() + className.substring(1), (api as any)[className]);
+}
+
+export class Playwright {
+  readonly selectors = selectors;
+  readonly devices: types.Devices;
+  readonly errors: { TimeoutError: typeof TimeoutError };
+  readonly chromium: (Chromium|undefined);
+  readonly firefox: (Firefox|undefined);
+  readonly webkit: (WebKit|undefined);
+
+  constructor(packagePath: string, browsers: browserPaths.BrowserDescriptor[]) {
+    this.devices = DeviceDescriptors;
+    this.errors = { TimeoutError };
+
+    const chromium = browsers.find(browser => browser.name === 'chromium');
+    if (chromium)
+      this.chromium = new Chromium(packagePath, chromium);
+
+    const firefox = browsers.find(browser => browser.name === 'firefox');
+    if (firefox)
+      this.firefox = new Firefox(packagePath, firefox);
+
+    const webkit = browsers.find(browser => browser.name === 'webkit');
+    if (webkit)
+      this.webkit = new WebKit(packagePath, webkit);
+  }
 }

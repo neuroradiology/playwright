@@ -20,10 +20,21 @@ export const Events = {
     Disconnected: 'disconnected'
   },
 
+  BrowserContext: {
+    Close: 'close',
+    Page: 'page',
+  },
+
+  BrowserServer: {
+    Close: 'close',
+  },
+
   Page: {
     Close: 'close',
+    Crash: 'crash',
     Console: 'console',
     Dialog: 'dialog',
+    Download: 'download',
     FileChooser: 'filechooser',
     DOMContentLoaded: 'domcontentloaded',
     // Can't use just 'error' due to node.js special treatment of error events.
@@ -38,16 +49,10 @@ export const Events = {
     FrameNavigated: 'framenavigated',
     Load: 'load',
     Popup: 'popup',
-    WebSocket: 'websocket',
-    WorkerCreated: 'workercreated',
-    WorkerDestroyed: 'workerdestroyed',
+    Worker: 'worker',
   },
 
-  WebSocket: {
+  Worker: {
     Close: 'close',
-    Error: 'error',
-    MessageReceived: 'messageReceived',
-    MessageSent: 'messageSent',
-    Open: 'open',
-  }
+  },
 };

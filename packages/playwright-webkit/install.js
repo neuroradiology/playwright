@@ -13,5 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-const {downloadBrowser} = require('playwright-core/download-browser');
-downloadBrowser('webkit');
+
+const { installBrowsersWithProgressBar } = require('playwright-core/lib/install/installer');
+
+installBrowsersWithProgressBar(__dirname);

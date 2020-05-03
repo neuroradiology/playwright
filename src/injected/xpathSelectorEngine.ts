@@ -20,13 +20,11 @@ const maxTextLength = 80;
 const minMeaningfulSelectorLegth = 100;
 
 export const XPathEngine: SelectorEngine = {
-  name: 'xpath',
-
   create(root: SelectorRoot, targetElement: Element, type: SelectorType): string | undefined {
     const maybeDocument = root instanceof Document ? root : root.ownerDocument;
     if (!maybeDocument)
       return;
-    const document = maybeDocument!;
+    const document = maybeDocument;
 
     const xpathCache = new Map<string, Element[]>();
     if (type === 'notext')
@@ -135,7 +133,7 @@ export const XPathEngine: SelectorEngine = {
       let tagWithOrdinal = tag;
       if (parent) {
         const siblings = Array.from(parent.children);
-        const sameTagSiblings = siblings.filter(sibling => (sibling as Element).nodeName.toLowerCase() === nodeName);
+        const sameTagSiblings = siblings.filter(sibling => (sibling).nodeName.toLowerCase() === nodeName);
         if (sameTagSiblings.length > 1)
           tagWithOrdinal += `[${1 + siblings.indexOf(element)}]`;
       }

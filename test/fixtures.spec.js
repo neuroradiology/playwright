@@ -16,27 +16,125 @@
  */
 
 const path = require('path');
-const {spawn} = require('child_process');
+const {spawn, execSync} = require('child_process');
+const {FFOX, CHROMIUM, WEBKIT, WIN, LINUX} = require('./utils').testOptions(browserType);
 
-module.exports.describe = function({testRunner, expect, product, playwrightPath, FFOX, CHROMIUM, WEBKIT}) {
-  const {describe, xdescribe, fdescribe} = testRunner;
-  const {it, fit, xit, dit} = testRunner;
-  const {beforeAll, beforeEach, afterAll, afterEach} = testRunner;
+async function testSignal(state, action, exitOnClose) {
+  const options = Object.assign({}, state.defaultBrowserOptions, {
+    handleSIGINT: true,
+    handleSIGTERM: true,
+    handleSIGHUP: true,
+    executablePath: state.browserType.executablePath(),
+  });
+  const res = spawn('node', [path.join(__dirname, 'fixtures', 'closeme.js'), state.playwrightPath, state.browserType.name(), JSON.stringify(options), exitOnClose ? 'true' : '']);
+  let wsEndPointCallback;
+  const wsEndPointPromise = new Promise(x => wsEndPointCallback = x);
+  let output = '';
+  let browserExitCode = 'none';
+  let browserSignal = 'none';
+  let browserPid;
+  res.stdout.on('data', data => {
+    output += data.toString();
+    // Uncomment to debug these tests.
+    // console.log(data.toString());
+    let match = output.match(/browserWS:(.+):browserWS/);
+    if (match)
+      wsEndPointCallback(match[1]);
+    match = output.match(/browserClose:([^:]+):([^:]+):browserClose/);
+    if (match) {
+      browserExitCode = match[1];
+      browserSignal = match[2];
+    }
+    match = output.match(/browserPid:([^:]+):browserPid/);
+    if (match)
+      browserPid = +match[1];
+  });
+  res.on('error', (...args) => console.log("ERROR", ...args));
+  const browser = await state.browserType.connect({ wsEndpoint: await wsEndPointPromise });
+  const promises = [
+    new Promise(resolve => browser.once('disconnected', resolve)),
+    new Promise(resolve => res.on('exit', resolve)),
+  ];
+  action(res, browserPid);
+  const [, exitCode] = await Promise.all(promises);
+  return { exitCode, browserSignal, browserExitCode, output };
+}
 
-  describe('Fixtures', function() {
-    it('dumpio option should work with pipe option ', async({server}) => {
-      let dumpioData = '';
-      const res = spawn('node', [path.join(__dirname, 'fixtures', 'dumpio.js'), playwrightPath, product, 'use-pipe']);
-      res.stderr.on('data', data => dumpioData += data.toString('utf8'));
-      await new Promise(resolve => res.on('close', resolve));
-      expect(dumpioData).toContain('message from dumpio');
+describe('Fixtures', function() {
+  it.slow()('should close the browser when the node process closes', async state => {
+    const result = await testSignal(state, child => {
+      if (WIN)
+        execSync(`taskkill /pid ${child.pid} /T /F`);
+      else
+        process.kill(child.pid);
     });
-    it('should dump browser process stderr', async({server}) => {
-      let dumpioData = '';
-      const res = spawn('node', [path.join(__dirname, 'fixtures', 'dumpio.js'), playwrightPath, product]);
-      res.stderr.on('data', data => dumpioData += data.toString('utf8'));
-      await new Promise(resolve => res.on('close', resolve));
-      expect(dumpioData).toContain('message from dumpio');
+    expect(result.exitCode).toBe(WIN ? 1 : 0);
+    // We might not get browser exitCode in time when killing the parent node process,
+    // so we don't check it here.
+  });
+
+  describe.skip(WIN)('signals', () => {
+    // Cannot reliably send signals on Windows.
+    it.slow()('should report browser close signal', async state => {
+      const result = await testSignal(state, (child, browserPid) => process.kill(browserPid), true);
+      expect(result.exitCode).toBe(0);
+      expect(result.browserExitCode).toBe('null');
+      expect(result.browserSignal).toBe('SIGTERM');
+    });
+    it.slow()('should report browser close signal 2', async state => {
+      const result = await testSignal(state, (child, browserPid) => process.kill(browserPid, 'SIGKILL'), true);
+      expect(result.exitCode).toBe(0);
+      expect(result.browserExitCode).toBe('null');
+      expect(result.browserSignal).toBe('SIGKILL');
+    });
+    it.slow()('should close the browser on SIGINT', async state => {
+      const result = await testSignal(state, child => process.kill(child.pid, 'SIGINT'));
+      expect(result.exitCode).toBe(130);
+      expect(result.browserExitCode).toBe('0');
+      expect(result.browserSignal).toBe('null');
+    });
+    it.slow()('should close the browser on SIGTERM', async state => {
+      const result = await testSignal(state, child => process.kill(child.pid, 'SIGTERM'));
+      expect(result.exitCode).toBe(0);
+      expect(result.browserExitCode).toBe('0');
+      expect(result.browserSignal).toBe('null');
+    });
+    it.slow()('should close the browser on SIGHUP', async state => {
+      const result = await testSignal(state, child => process.kill(child.pid, 'SIGHUP'));
+      expect(result.exitCode).toBe(0);
+      expect(result.browserExitCode).toBe('0');
+      expect(result.browserSignal).toBe('null');
+    });
+    it.slow()('should kill the browser on double SIGINT', async state => {
+      const result = await testSignal(state, child => {
+        process.kill(child.pid, 'SIGINT');
+        process.kill(child.pid, 'SIGINT');
+      });
+      expect(result.exitCode).toBe(130);
+      // TODO: ideally, we would expect the SIGKILL on the browser from
+      // force kill, but that's racy with sending two signals.
+    });
+    // TODO: flaky - https://app.circleci.com/pipelines/github/microsoft/playwright/582/workflows/b49033ce-fe20-4029-b665-13fb331f842e/jobs/579
+    it.slow().fail(FFOX && LINUX)('should kill the browser on SIGINT + SIGTERM', async state => {
+      const result = await testSignal(state, child => {
+        process.kill(child.pid, 'SIGINT');
+        process.kill(child.pid, 'SIGTERM');
+      });
+      expect(result.exitCode).toBe(130);
+      // TODO: ideally, we would expect the SIGKILL on the browser from
+      // force kill, but that's racy with sending two signals.
+    });
+    // TODO: flaky!
+    // - firefox: https://github.com/microsoft/playwright/pull/1911/checks?check_run_id=607148951
+    // - chromium: https://travis-ci.com/github/microsoft/playwright/builds/161356178
+    it.slow().fail((FFOX || CHROMIUM) && LINUX)('should kill the browser on SIGTERM + SIGINT', async state => {
+      const result = await testSignal(state, child => {
+        process.kill(child.pid, 'SIGTERM');
+        process.kill(child.pid, 'SIGINT');
+      });
+      expect(result.exitCode).toBe(130);
+      // TODO: ideally, we would expect the SIGKILL on the browser from
+      // force kill, but that's racy with sending two signals.
     });
   });
-};
+});

@@ -1,6 +1,5 @@
 /**
- * Copyright 2018 Google Inc. All rights reserved.
- * Modifications copyright (c) Microsoft Corporation.
+ * Copyright 2020 Microsoft Corporation. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,15 +14,27 @@
  * limitations under the License.
  */
 
-module.exports.describe = function({testRunner, expect, headless, playwright, FFOX, CHROMIUM, WEBKIT}) {
-  const {describe, xdescribe, fdescribe} = testRunner;
-  const {it, fit, xit, dit} = testRunner;
-  const {beforeAll, beforeEach, afterAll, afterEach} = testRunner;
+const {FFOX, CHROMIUM, WEBKIT} = require('./utils').testOptions(browserType);
 
-  describe('Browser.process', function() {
-    it('should return child_process instance', async function({browserServer}) {
-      const process = await browserServer.process();
-      expect(process.pid).toBeGreaterThan(0);
-    });
+describe('Browser.newPage', function() {
+  it('should create new page', async function({browser}) {
+    const page1 = await browser.newPage();
+    expect(browser.contexts().length).toBe(1);
+
+    const page2 = await browser.newPage();
+    expect(browser.contexts().length).toBe(2);
+
+    await page1.close();
+    expect(browser.contexts().length).toBe(1);
+
+    await page2.close();
+    expect(browser.contexts().length).toBe(0);
   });
-};
+  it('should throw upon second create new page', async function({browser}) {
+    const page = await browser.newPage();
+    let error;
+    await page.context().newPage().catch(e => error = e);
+    await page.close();
+    expect(error.message).toContain('Please use browser.newContext()');
+  });
+});

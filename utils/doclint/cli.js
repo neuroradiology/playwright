@@ -15,9 +15,14 @@
  * limitations under the License.
  */
 
-const playwright = require('../../index.js').chromium;
+const playwright = require('../../index.js');
 const path = require('path');
 const Source = require('./Source');
+const Message = require('./Message');
+
+const {spawnSync} = require('child_process');
+
+const os = require('os');
 
 const PROJECT_DIR = path.join(__dirname, '..', '..');
 const VERSION = require(path.join(PROJECT_DIR, 'package.json')).version;
@@ -38,19 +43,27 @@ async function run() {
   // Documentation checks.
   {
     const readme = await Source.readFile(path.join(PROJECT_DIR, 'README.md'));
+    const contributing = await Source.readFile(path.join(PROJECT_DIR, 'CONTRIBUTING.md'));
     const api = await Source.readFile(path.join(PROJECT_DIR, 'docs', 'api.md'));
-    const mdSources = [readme, api];
+    const docs = await Source.readdir(path.join(PROJECT_DIR, 'docs'), '.md');
+    const mdSources = [readme, api, contributing, ...docs];
 
     const preprocessor = require('./preprocessor');
-    messages.push(...await preprocessor.runCommands(mdSources, VERSION));
-    messages.push(...await preprocessor.ensureReleasedAPILinks([readme], VERSION));
+    const browserVersions = await getBrowserVersions();
+    messages.push(...(await preprocessor.runCommands(mdSources, {
+      libversion: VERSION,
+      chromiumVersion: browserVersions.chromium,
+      firefoxVersion: browserVersions.firefox,
+    })));
+    messages.push(...preprocessor.autocorrectInvalidLinks(PROJECT_DIR, mdSources, getRepositoryFiles()));
+    for (const source of mdSources.filter(source => source.hasUpdatedText()))
+      messages.push(Message.warning(`WARN: updated ${source.projectPath()}`));
 
-    const browser = await playwright.launch();
-    const page = await browser.defaultContext().newPage();
+    const browser = await playwright.chromium.launch();
+    const page = await browser.newPage();
     const checkPublicAPI = require('./check_public_api');
     const jsSources = await Source.readdir(path.join(PROJECT_DIR, 'src'));
-    const externalDependencies = Object.keys(require('../../src/web.webpack.config').externals);
-    messages.push(...await checkPublicAPI(page, mdSources, jsSources, externalDependencies));
+    messages.push(...await checkPublicAPI(page, [api], jsSources));
     await browser.close();
 
     for (const source of mdSources) {
@@ -59,8 +72,6 @@ async function run() {
       await source.save();
       changedFiles = true;
     }
-    
-    await readme.saveAs(path.join(PROJECT_DIR, 'packages', 'playwright', 'README.md'));
   }
 
   // Report results.
@@ -92,4 +103,40 @@ async function run() {
   const runningTime = Date.now() - startTime;
   console.log(`DocLint Finished in ${runningTime / 1000} seconds`);
   process.exit(clearExit ? 0 : 1);
+}
+
+async function getBrowserVersions() {
+  const [chromium, firefox] = await Promise.all([
+    getChromeVersion(),
+    getFirefoxVersion(),
+  ])
+  return {
+    chromium,
+    firefox,
+  };
+}
+
+async function getChromeVersion() {
+  if (os.platform() === 'win32' || os.platform() === 'cygwin') {
+    const browser = await playwright.chromium.launch();
+    const page = await browser.newPage();
+    const userAgent = await page.evaluate('navigator.userAgent');
+    const [type] = userAgent.split(' ').filter(str => str.includes('Chrome'));
+    await browser.close();
+    return type.split('/')[1];
+  }
+  const version = spawnSync(playwright.chromium.executablePath(), ['--version'], undefined).stdout.toString();
+  return version.trim().split(' ').pop();
+}
+
+function getRepositoryFiles() {
+  const out = spawnSync('git', ['ls-files'], {cwd: PROJECT_DIR});
+  return out.stdout.toString().trim().split('\n').map(file => path.join(PROJECT_DIR, file));
+}
+
+async function getFirefoxVersion() {
+  const isWin = os.platform() === 'win32' || os.platform() === 'cygwin';
+  const out = spawnSync(playwright.firefox.executablePath(), [isWin ? '/version' : '--version'], undefined);
+  const version = out.stdout.toString();
+  return version.trim().split(' ').pop();
 }

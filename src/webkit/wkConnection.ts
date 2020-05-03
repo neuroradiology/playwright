@@ -15,14 +15,13 @@
  * limitations under the License.
  */
 
+import { EventEmitter } from 'events';
 import { assert } from '../helper';
-import * as platform from '../platform';
-import { ConnectionTransport } from '../transport';
+import { ConnectionTransport, ProtocolRequest, ProtocolResponse, protocolLog } from '../transport';
 import { Protocol } from './protocol';
+import { InnerLogger } from '../logger';
 
-const debugProtocol = platform.debug('pw:protocol');
-
-// WKBrowserServer uses this special id to issue Browser.close command which we
+// WKPlaywright uses this special id to issue Browser.close command which we
 // should ignore.
 export const kBrowserCloseMessageId = -9999;
 
@@ -32,15 +31,17 @@ export const kPageProxyMessageReceived = 'kPageProxyMessageReceived';
 export type PageProxyMessageReceivedPayload = { pageProxyId: string, message: any };
 
 export class WKConnection {
-  private _lastId = 0;
   private readonly _transport: ConnectionTransport;
+  private readonly _onDisconnect: () => void;
+  private _lastId = 0;
   private _closed = false;
-  private _onDisconnect: () => void;
 
   readonly browserSession: WKSession;
+  private _logger: InnerLogger;
 
-  constructor(transport: ConnectionTransport, onDisconnect: () => void) {
+  constructor(transport: ConnectionTransport, logger: InnerLogger, onDisconnect: () => void) {
     this._transport = transport;
+    this._logger = logger;
     this._transport.onmessage = this._dispatchMessage.bind(this);
     this._transport.onclose = this._onClose.bind(this);
     this._onDisconnect = onDisconnect;
@@ -53,23 +54,23 @@ export class WKConnection {
     return ++this._lastId;
   }
 
-  rawSend(message: any) {
-    message = JSON.stringify(message);
-    debugProtocol('SEND ► ' + message);
+  rawSend(message: ProtocolRequest) {
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, 'SEND ► ' + rewriteInjectedScriptEvaluationLog(message));
     this._transport.send(message);
   }
 
-  private _dispatchMessage(message: string) {
-    debugProtocol('◀ RECV ' + message);
-    const object = JSON.parse(message);
-    if (object.id === kBrowserCloseMessageId)
+  private _dispatchMessage(message: ProtocolResponse) {
+    if (this._logger._isLogEnabled(protocolLog))
+      this._logger._log(protocolLog, '◀ RECV ' + JSON.stringify(message));
+    if (message.id === kBrowserCloseMessageId)
       return;
-    if (object.pageProxyId) {
-      const payload: PageProxyMessageReceivedPayload = { message: object, pageProxyId: object.pageProxyId };
+    if (message.pageProxyId) {
+      const payload: PageProxyMessageReceivedPayload = { message: message, pageProxyId: message.pageProxyId };
       this.browserSession.dispatchMessage({ method: kPageProxyMessageReceived, params: payload });
       return;
     }
-    this.browserSession.dispatchMessage(object);
+    this.browserSession.dispatchMessage(message);
   }
 
   _onClose() {
@@ -90,14 +91,15 @@ export class WKConnection {
   }
 }
 
-export class WKSession extends platform.EventEmitter {
+export class WKSession extends EventEmitter {
   connection: WKConnection;
   errorText: string;
   readonly sessionId: string;
 
   private _disposed = false;
   private readonly _rawSend: (message: any) => void;
-  private readonly _callbacks = new Map<number, {resolve:(o: any) => void, reject: (e: Error) => void, error: Error, method: string}>();
+  private readonly _callbacks = new Map<number, {resolve: (o: any) => void, reject: (e: Error) => void, error: Error, method: string}>();
+  private _crashed: boolean = false;
 
   on: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
   addListener: <T extends keyof Protocol.Events | symbol>(event: T, listener: (payload: T extends symbol ? any : Protocol.Events[T extends keyof Protocol.Events ? T : never]) => void) => this;
@@ -119,20 +121,24 @@ export class WKSession extends platform.EventEmitter {
     this.once = super.once;
   }
 
-  send<T extends keyof Protocol.CommandParameters>(
+  async send<T extends keyof Protocol.CommandParameters>(
     method: T,
     params?: Protocol.CommandParameters[T]
   ): Promise<Protocol.CommandReturnValues[T]> {
+    if (this._crashed)
+      throw new Error('Target crashed');
     if (this._disposed)
-      return Promise.reject(new Error(`Protocol error (${method}): ${this.errorText}`));
+      throw new Error(`Protocol error (${method}): ${this.errorText}`);
     const id = this.connection.nextMessageId();
     const messageObj = { id, method, params };
-    platform.debug('pw:wrapped:' + this.sessionId)('SEND ► ' + JSON.stringify(messageObj, null, 2));
-    const result = new Promise<Protocol.CommandReturnValues[T]>((resolve, reject) => {
+    this._rawSend(messageObj);
+    return new Promise<Protocol.CommandReturnValues[T]>((resolve, reject) => {
       this._callbacks.set(id, {resolve, reject, error: new Error(), method});
     });
-    this._rawSend(messageObj);
-    return result;
+  }
+
+  markAsCrashed() {
+    this._crashed = true;
   }
 
   isDisposed(): boolean {
@@ -147,12 +153,11 @@ export class WKSession extends platform.EventEmitter {
   }
 
   dispatchMessage(object: any) {
-    platform.debug('pw:wrapped:' + this.sessionId)('◀ RECV ' + JSON.stringify(object, null, 2));
     if (object.id && this._callbacks.has(object.id)) {
       const callback = this._callbacks.get(object.id)!;
       this._callbacks.delete(object.id);
       if (object.error)
-        callback.reject(createProtocolError(callback.error, callback.method, object));
+        callback.reject(createProtocolError(callback.error, callback.method, object.error));
       else
         callback.resolve(object.result);
     } else if (object.id) {
@@ -164,10 +169,10 @@ export class WKSession extends platform.EventEmitter {
   }
 }
 
-export function createProtocolError(error: Error, method: string, object: { error: { message: string; data: any; }; }): Error {
-  let message = `Protocol error (${method}): ${object.error.message}`;
-  if ('data' in object.error)
-    message += ` ${object.error.data}`;
+export function createProtocolError(error: Error, method: string, protocolError: { message: string; data: any; }): Error {
+  let message = `Protocol error (${method}): ${protocolError.message}`;
+  if ('data' in protocolError)
+    message += ` ${JSON.stringify(protocolError.data)}`;
   return rewriteError(error, message);
 }
 
@@ -178,4 +183,12 @@ export function rewriteError(error: Error, message: string): Error {
 
 export function isSwappedOutError(e: Error) {
   return e.message.includes('Target was swapped out.');
+}
+
+function rewriteInjectedScriptEvaluationLog(message: any): string {
+  // Injected script is very long and clutters protocol logs.
+  // To increase development velocity, we skip replace it with short description in the log.
+  if (message.params && message.params.message && message.params.message.includes('Runtime.evaluate') && message.params.message.includes('src/injected/injected.ts'))
+    return `{"id":${message.id},"method":"${message.method}","params":{"message":[evaluate injected script],"targetId":"${message.params.targetId}"},"pageProxyId":${message.pageProxyId}}`;
+  return JSON.stringify(message);
 }

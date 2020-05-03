@@ -19,23 +19,26 @@ export { Browser } from './browser';
 export { BrowserContext } from './browserContext';
 export { ConsoleMessage } from './console';
 export { Dialog } from './dialog';
+export { Download } from './download';
 export { ElementHandle } from './dom';
+export { FileChooser } from './fileChooser';
+export { Logger } from './logger';
 export { TimeoutError } from './errors';
 export { Frame } from './frames';
 export { Keyboard, Mouse } from './input';
 export { JSHandle } from './javascript';
-export { Request, Response } from './network';
-export { Coverage, FileChooser, Page, Worker } from './page';
+export { Request, Response, Route } from './network';
+export { Page, Worker } from './page';
+export { Selectors } from './selectors';
 
 export { CRBrowser as ChromiumBrowser } from './chromium/crBrowser';
-export { CRSession as ChromiumSession } from './chromium/crConnection';
-export { CRTarget as ChromiumTarget } from './chromium/crTarget';
+export { CRBrowserContext as ChromiumBrowserContext } from './chromium/crBrowser';
+export { CRCoverage as ChromiumCoverage } from './chromium/crCoverage';
+export { CRSession as CDPSession } from './chromium/crConnection';
 
 export { FFBrowser as FirefoxBrowser } from './firefox/ffBrowser';
 
 export { WKBrowser as WebKitBrowser } from './webkit/wkBrowser';
 
-export { Playwright } from './server/playwright';
-export { CRPlaywright as ChromiumPlaywright, CRBrowserServer as ChromiumBrowserServer } from './server/crPlaywright';
-export { FFPlaywright as FirefoxPlaywright, FFBrowserServer as FirefoxBrowserServer } from './server/ffPlaywright';
-export { WKPlaywright as WebKitPlaywright, WKBrowserServer as WebKitBrowserServer } from './server/wkPlaywright';
+export { BrowserType } from './server/browserType';
+export { BrowserServer } from './server/browserServer';
